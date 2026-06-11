@@ -1,0 +1,14 @@
+build/
+bin/
+obj/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.ipch
+.vs/

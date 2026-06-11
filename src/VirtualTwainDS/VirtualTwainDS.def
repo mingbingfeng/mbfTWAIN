@@ -1,0 +1,4 @@
+LIBRARY "mbfVirtualTwainDS.ds"
+
+EXPORTS
+    DS_Entry @1

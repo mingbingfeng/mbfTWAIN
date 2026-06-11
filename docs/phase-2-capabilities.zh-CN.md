@@ -1,0 +1,76 @@
+# Phase 2 能力协商
+
+Phase 2 在 `DG_CONTROL / DAT_CAPABILITY` 上实现了可验证的能力协商。
+
+## 支持的能力
+
+```text
+CAP_SUPPORTEDCAPS
+CAP_XFERCOUNT
+CAP_DUPLEXENABLED
+ICAP_PIXELTYPE
+ICAP_XRESOLUTION
+ICAP_YRESOLUTION
+ICAP_XFERMECH
+```
+
+`CAP_SUPPORTEDCAPS` 是只读能力，用于让宿主发现本虚拟扫描仪当前支持的能力集合。
+
+`ICAP_XFERMECH` 当前广告 `TWSX_NATIVE` 和 `TWSX_MEMORY`。
+
+## 支持的消息
+
+可变能力支持：
+
+```text
+MSG_GET
+MSG_GETCURRENT
+MSG_GETDEFAULT
+MSG_SET
+MSG_RESET
+MSG_QUERYSUPPORT
+```
+
+只读能力 `CAP_SUPPORTEDCAPS` 支持：
+
+```text
+MSG_GET
+MSG_GETCURRENT
+MSG_GETDEFAULT
+MSG_QUERYSUPPORT
+```
+
+`MSG_RESETALL` 会重置所有可变能力到默认值。
+
+## 默认值
+
+```text
+CAP_DUPLEXENABLED = FALSE
+CAP_XFERCOUNT = -1
+ICAP_PIXELTYPE = TWPT_RGB
+ICAP_XRESOLUTION = 300 DPI
+ICAP_YRESOLUTION = 300 DPI
+ICAP_XFERMECH = TWSX_NATIVE
+```
+
+UI 展示为单个 DPI 预设；TWAIN capability 层仍按规范分别暴露 `ICAP_XRESOLUTION` 和 `ICAP_YRESOLUTION`，UI 设置时把两者同步为同一个 DPI 值。分辨率当前采用离散枚举值：
+
+```text
+150, 200, 300, 600
+```
+
+## 容器规则
+
+`MSG_GET` 返回 `TWON_ENUMERATION`，包含支持值、当前索引和默认索引。
+
+`MSG_GETCURRENT` / `MSG_GETDEFAULT` 返回 `TWON_ONEVALUE`。
+
+`MSG_SET` 接收 `TWON_ONEVALUE` 或 `TWON_ENUMERATION`。如果接收枚举容器，则读取 `CurrentIndex` 指向的值。
+
+所有由 DS 返回的容器使用 `GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT)` 分配，调用方消费后应释放。DS 不释放应用传入的 `hContainer`。
+
+## 状态规则
+
+能力协商要求 Source 至少处于 State 4 `SourceOpened`。State 3 调用能力 triplet 会返回 `TWRC_FAILURE`，`DAT_STATUS` 条件码为 `TWCC_CAPSEQERROR`。
+
+未知能力返回 `TWCC_CAPUNSUPPORTED`。无效能力值返回 `TWCC_BADVALUE`。不支持的能力操作返回 `TWCC_CAPBADOPERATION`。
