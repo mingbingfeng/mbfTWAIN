@@ -282,11 +282,15 @@ function Run-Smoke([string]$Platform) {
     Assert-File $dsPath "DS missing"
     Assert-File $smokePath "SmokeDsEntry missing"
 
+    Get-Process -Name "mbfTwain.VirtualScannerConfig" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
     Write-Step "Smoke test $Platform"
     Invoke-WithTemporaryEnvironment @{
         MBF_TWAIN_FORCE_UI = "0"
         MBF_SMOKE_EXPECT_XFERREADY = $null
         MBF_SMOKE_EXPECT_ENABLE_CALLBACK = $null
+        MBF_SMOKE_EXPECT_PAPER_A3 = $null
         MBF_SMOKE_USE_MEMORY = $null
     } {
         Invoke-Checked {
@@ -335,6 +339,7 @@ function Run-UiDelayedReadySmoke([string]$Platform) {
             MBF_TWAIN_FORCE_UI = "1"
             MBF_SMOKE_EXPECT_XFERREADY = "1"
             MBF_SMOKE_EXPECT_ENABLE_CALLBACK = "1"
+            MBF_SMOKE_EXPECT_PAPER_A3 = "1"
             MBF_SMOKE_USE_MEMORY = $null
         } {
             Invoke-Checked {

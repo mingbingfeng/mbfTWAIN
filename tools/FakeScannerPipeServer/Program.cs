@@ -9,6 +9,7 @@ internal sealed record Options(
     uint Revision,
     bool DuplexEnabled,
     string PixelType,
+    string PaperSize,
     int XResolution,
     int YResolution,
     bool ScanRequested,
@@ -36,6 +37,11 @@ internal static class Program
     private static void RunServer(Options initialOptions)
     {
         uint revision = initialOptions.Revision;
+        bool duplexEnabled = initialOptions.DuplexEnabled;
+        string pixelType = initialOptions.PixelType;
+        string paperSize = initialOptions.PaperSize;
+        int xResolution = initialOptions.XResolution;
+        int yResolution = initialOptions.YResolution;
         bool scanRequested = initialOptions.ScanRequested;
         long? scanReadyAtTick = null;
 
@@ -87,12 +93,14 @@ internal static class Program
             if (string.Equals(command, "GET_STATE", StringComparison.Ordinal))
             {
                 MaybePromoteDelayedReady();
-                WriteState(writer, initialOptions, revision, scanRequested);
+                WriteState(writer, revision, duplexEnabled, pixelType, paperSize, xResolution, yResolution, scanRequested, initialOptions.Images);
                 continue;
             }
 
-            if (string.Equals(command, "BEGIN_SCAN", StringComparison.Ordinal))
+            if (string.Equals(command, "BEGIN_SCAN", StringComparison.Ordinal) ||
+                (command is not null && command.StartsWith("BEGIN_SCAN ", StringComparison.Ordinal)))
             {
+                ApplyBeginScanSettings(command, ref duplexEnabled, ref pixelType, ref paperSize, ref xResolution, ref yResolution);
                 if (initialOptions.ScanAfterBeginDelayMilliseconds is int delayMilliseconds)
                 {
                     scanRequested = false;
@@ -123,22 +131,90 @@ internal static class Program
         }
     }
 
-    private static void WriteState(StreamWriter writer, Options options, uint revision, bool scanRequested)
+    private static void WriteState(
+        StreamWriter writer,
+        uint revision,
+        bool duplexEnabled,
+        string pixelType,
+        string paperSize,
+        int xResolution,
+        int yResolution,
+        bool scanRequested,
+        IReadOnlyList<string> images)
     {
         writer.WriteLine("OK STATE");
         writer.WriteLine(FormattableString.Invariant($"revision {revision}"));
-        writer.WriteLine(FormattableString.Invariant($"duplex {(options.DuplexEnabled ? 1 : 0)}"));
-        writer.WriteLine($"pixel {options.PixelType}");
-        writer.WriteLine(FormattableString.Invariant($"xres {options.XResolution}"));
-        writer.WriteLine(FormattableString.Invariant($"yres {options.YResolution}"));
+        writer.WriteLine(FormattableString.Invariant($"duplex {(duplexEnabled ? 1 : 0)}"));
+        writer.WriteLine($"pixel {pixelType}");
+        writer.WriteLine($"paper {paperSize}");
+        writer.WriteLine(FormattableString.Invariant($"xres {xResolution}"));
+        writer.WriteLine(FormattableString.Invariant($"yres {yResolution}"));
         writer.WriteLine(FormattableString.Invariant($"scan {(scanRequested ? 1 : 0)}"));
 
-        foreach (string image in options.Images)
+        foreach (string image in images)
         {
             writer.WriteLine($"image {image}");
         }
 
         writer.WriteLine("END");
+    }
+
+    private static void ApplyBeginScanSettings(
+        string? command,
+        ref bool duplexEnabled,
+        ref string pixelType,
+        ref string paperSize,
+        ref int xResolution,
+        ref int yResolution)
+    {
+        if (command is null)
+        {
+            return;
+        }
+
+        string[] tokens = command.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        foreach (string token in tokens.Skip(1))
+        {
+            string[] parts = token.Split('=', 2);
+            if (parts.Length != 2)
+            {
+                continue;
+            }
+
+            switch (parts[0])
+            {
+                case "duplex":
+                    if (parts[1] is "0" or "1")
+                    {
+                        duplexEnabled = parts[1] == "1";
+                    }
+                    break;
+                case "pixel":
+                    if (parts[1] is "BW" or "GRAY" or "RGB")
+                    {
+                        pixelType = parts[1];
+                    }
+                    break;
+                case "paper":
+                    if (parts[1] is "A4" or "A3")
+                    {
+                        paperSize = parts[1];
+                    }
+                    break;
+                case "xres":
+                    if (int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out int parsedXResolution))
+                    {
+                        xResolution = parsedXResolution;
+                    }
+                    break;
+                case "yres":
+                    if (int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out int parsedYResolution))
+                    {
+                        yResolution = parsedYResolution;
+                    }
+                    break;
+            }
+        }
     }
 
     private static bool TryParseOptions(
@@ -150,6 +226,7 @@ internal static class Program
         uint revision = 1;
         bool duplexEnabled = false;
         string pixelType = "RGB";
+        string paperSize = "A4";
         int xResolution = 300;
         int yResolution = 300;
         bool scanRequested = true;
@@ -199,6 +276,16 @@ internal static class Program
                     }
 
                     pixelType = value;
+                    index++;
+                    break;
+
+                case "--paper":
+                    if (value is not ("A4" or "A4LETTER" or "A3"))
+                    {
+                        return Fail("Invalid --paper value", out options, out error);
+                    }
+
+                    paperSize = value == "A4LETTER" ? "A4" : value;
                     index++;
                     break;
 
@@ -286,6 +373,7 @@ internal static class Program
             revision,
             duplexEnabled,
             pixelType,
+            paperSize,
             xResolution,
             yResolution,
             scanRequested,
@@ -326,6 +414,6 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.Error.WriteLine(
-            "Usage: FakeScannerPipeServer --image <path> [--connections 3] [--pixel RGB|GRAY|BW] [--revision n] [--scan-after-begin-delay-ms n]");
+            "Usage: FakeScannerPipeServer --image <path> [--connections 3] [--pixel RGB|GRAY|BW] [--paper A4|A3] [--revision n] [--scan-after-begin-delay-ms n]");
     }
 }

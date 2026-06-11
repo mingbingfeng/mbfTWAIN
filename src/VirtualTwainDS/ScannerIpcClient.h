@@ -21,6 +21,7 @@ struct ScannerIpcState
     std::uint32_t revision = 0;
     bool duplexEnabled = false;
     std::wstring pixelType = L"RGB";
+    std::wstring paperSize = L"A4";
     std::uint32_t xResolution = 300;
     std::uint32_t yResolution = 300;
     bool scanRequested = false;
@@ -34,6 +35,7 @@ public:
 
     bool Ping(DWORD timeoutMilliseconds = 150) const;
     bool BeginScan(DWORD timeoutMilliseconds = 150) const;
+    bool BeginScan(const ScannerIpcState& initialState, DWORD timeoutMilliseconds = 150) const;
     bool TryGetState(ScannerIpcState& state, DWORD timeoutMilliseconds = 150) const;
     bool AcknowledgeScan(std::uint32_t revision, DWORD timeoutMilliseconds = 150) const;
 

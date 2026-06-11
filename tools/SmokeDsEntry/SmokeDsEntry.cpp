@@ -431,7 +431,8 @@ int wmain(int argc, wchar_t** argv)
         (supported.ConType != TWON_ENUMERATION ||
          !EnumerationContains(supported.hContainer, TWTY_UINT16, ICAP_PIXELTYPE) ||
          !EnumerationContains(supported.hContainer, TWTY_UINT16, CAP_XFERCOUNT) ||
-         !EnumerationContains(supported.hContainer, TWTY_UINT16, CAP_DUPLEXENABLED)))
+         !EnumerationContains(supported.hContainer, TWTY_UINT16, CAP_DUPLEXENABLED) ||
+         !EnumerationContains(supported.hContainer, TWTY_UINT16, ICAP_SUPPORTEDSIZES)))
     {
         std::printf("CAP_SUPPORTEDCAPS: missing required capabilities\n");
         ++failures;
@@ -517,6 +518,38 @@ int wmain(int argc, wchar_t** argv)
         TWTY_BOOL,
         TRUE);
 
+    failures += ExpectOneValue(
+        "ICAP_SUPPORTEDSIZES/default current",
+        entry,
+        app,
+        ICAP_SUPPORTEDSIZES,
+        TWTY_UINT16,
+        TWSS_A4LETTER);
+
+    TW_CAPABILITY supportedSizes{};
+    supportedSizes.Cap = ICAP_SUPPORTEDSIZES;
+    failures += ExpectSuccess(
+        "ICAP_SUPPORTEDSIZES/MSG_GET",
+        entry(&app, DG_CONTROL, DAT_CAPABILITY, MSG_GET, &supportedSizes));
+    if (failures == 0 &&
+        (supportedSizes.ConType != TWON_ENUMERATION ||
+         !EnumerationContains(supportedSizes.hContainer, TWTY_UINT16, TWSS_A4LETTER) ||
+         !EnumerationContains(supportedSizes.hContainer, TWTY_UINT16, TWSS_A3)))
+    {
+        std::printf("ICAP_SUPPORTEDSIZES/MSG_GET: missing A4 or A3\n");
+        ++failures;
+    }
+    FreeContainer(supportedSizes);
+
+    failures += SetOneValue("ICAP_SUPPORTEDSIZES/SET A3", entry, app, ICAP_SUPPORTEDSIZES, TWTY_UINT16, TWSS_A3);
+    failures += ExpectOneValue(
+        "ICAP_SUPPORTEDSIZES/current A3",
+        entry,
+        app,
+        ICAP_SUPPORTEDSIZES,
+        TWTY_UINT16,
+        TWSS_A3);
+
     failures += SetOneValue(
         "ICAP_XRESOLUTION/SET 600",
         entry,
@@ -587,6 +620,15 @@ int wmain(int argc, wchar_t** argv)
         entry(&app, DG_CONTROL, DAT_CAPABILITY, MSG_SET, &invalidPixel));
     FreeContainer(invalidPixel);
 
+    TW_CAPABILITY invalidPaper{};
+    invalidPaper.Cap = ICAP_SUPPORTEDSIZES;
+    invalidPaper.ConType = TWON_ONEVALUE;
+    invalidPaper.hContainer = BuildOneValue(TWTY_UINT16, TWSS_USLETTER);
+    failures += ExpectFailure(
+        "ICAP_SUPPORTEDSIZES/SET invalid",
+        entry(&app, DG_CONTROL, DAT_CAPABILITY, MSG_SET, &invalidPaper));
+    FreeContainer(invalidPaper);
+
     TW_STATUS invalidStatus{};
     failures += ExpectSuccess(
         "DAT_STATUS/MSG_GET after invalid set",
@@ -603,6 +645,7 @@ int wmain(int argc, wchar_t** argv)
     TW_USERINTERFACE userInterface{};
     const bool expectXferReady = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_XFERREADY");
     const bool expectEnableCallback = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_ENABLE_CALLBACK");
+    const bool expectPaperA3 = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_PAPER_A3");
     userInterface.ShowUI = expectXferReady ? TRUE : FALSE;
     userInterface.ModalUI = FALSE;
     failures += ExpectSuccess(
@@ -641,6 +684,17 @@ int wmain(int argc, wchar_t** argv)
                     static_cast<unsigned long>(g_xferReadySourceId.load()),
                     static_cast<unsigned long>(g_xferReadyAppId.load()));
                 ++failures;
+            }
+
+            if (expectPaperA3)
+            {
+                failures += ExpectOneValue(
+                    "ICAP_SUPPORTEDSIZES/current A3 from IPC",
+                    entry,
+                    app,
+                    ICAP_SUPPORTEDSIZES,
+                    TWTY_UINT16,
+                    TWSS_A3);
             }
 
             TW_IMAGEINFO imageInfo{};
@@ -748,6 +802,9 @@ int wmain(int argc, wchar_t** argv)
                 TW_HANDLE dib = nullptr;
                 const TW_UINT16 transferReturn =
                     entry(&app, DG_IMAGE, DAT_IMAGENATIVEXFER, MSG_GET, &dib);
+                LONG transferredWidth = 0;
+                LONG transferredHeight = 0;
+                TW_UINT16 transferredBitsPerPixel = 0;
                 if (transferReturn == TWRC_XFERDONE && dib != nullptr)
                 {
                     auto* header = static_cast<BITMAPINFOHEADER*>(GlobalLock(dib));
@@ -762,6 +819,9 @@ int wmain(int argc, wchar_t** argv)
                     }
                     else
                     {
+                        transferredWidth = header->biWidth;
+                        transferredHeight = header->biHeight;
+                        transferredBitsPerPixel = header->biBitCount;
                         std::printf(
                             "DAT_IMAGENATIVEXFER/MSG_GET: XFERDONE %ld x %ld %u bpp\n",
                             static_cast<long>(header->biWidth),
@@ -774,6 +834,25 @@ int wmain(int argc, wchar_t** argv)
                         GlobalUnlock(dib);
                     }
                     GlobalFree(dib);
+
+                    TW_IMAGEINFO postTransferInfo{};
+                    failures += ExpectSuccess(
+                        "DAT_IMAGEINFO/MSG_GET after native xfer",
+                        entry(&app, DG_IMAGE, DAT_IMAGEINFO, MSG_GET, &postTransferInfo));
+                    if (postTransferInfo.ImageWidth != transferredWidth ||
+                        postTransferInfo.ImageLength != transferredHeight ||
+                        postTransferInfo.BitsPerPixel != transferredBitsPerPixel)
+                    {
+                        std::printf(
+                            "DAT_IMAGEINFO/MSG_GET after native xfer: expected %ld x %ld %u bpp, got %ld x %ld %d bpp\n",
+                            static_cast<long>(transferredWidth),
+                            static_cast<long>(transferredHeight),
+                            transferredBitsPerPixel,
+                            static_cast<long>(postTransferInfo.ImageWidth),
+                            static_cast<long>(postTransferInfo.ImageLength),
+                            postTransferInfo.BitsPerPixel);
+                        ++failures;
+                    }
                 }
                 else
                 {

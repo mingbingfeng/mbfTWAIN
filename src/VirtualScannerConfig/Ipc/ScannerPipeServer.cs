@@ -13,14 +13,14 @@ public sealed class ScannerPipeServer : IDisposable
     public const string PipeName = "mbfTwain.VirtualScanner.v1";
 
     private readonly Func<ScannerStateSnapshot> getSnapshot;
-    private readonly Action beginScan;
+    private readonly Action<ScannerSessionSettings?> beginScan;
     private readonly Action<uint> acknowledgeScan;
     private readonly CancellationTokenSource cancellation = new();
     private Task? serverTask;
 
     public ScannerPipeServer(
         Func<ScannerStateSnapshot> getSnapshot,
-        Action beginScan,
+        Action<ScannerSessionSettings?> beginScan,
         Action<uint> acknowledgeScan)
     {
         this.getSnapshot = getSnapshot;
@@ -109,15 +109,16 @@ public sealed class ScannerPipeServer : IDisposable
             ScannerStateSnapshot snapshot = getSnapshot();
             DiagnosticsLog.Write(
                 "UI-IPC",
-                $"GET_STATE revision={snapshot.Revision} scan={snapshot.ScanRequested} images={snapshot.SelectedImages.Count} pixel={snapshot.PixelType} xres={snapshot.XResolution} yres={snapshot.YResolution}");
+                $"GET_STATE revision={snapshot.Revision} scan={snapshot.ScanRequested} images={snapshot.SelectedImages.Count} pixel={snapshot.PixelType} paper={snapshot.PaperSize} xres={snapshot.XResolution} yres={snapshot.YResolution}");
             await WriteStateAsync(writer, snapshot).ConfigureAwait(false);
             return;
         }
 
-        if (string.Equals(command, "BEGIN_SCAN", StringComparison.Ordinal))
+        if (string.Equals(command, "BEGIN_SCAN", StringComparison.Ordinal) ||
+            command.StartsWith("BEGIN_SCAN ", StringComparison.Ordinal))
         {
             DiagnosticsLog.Write("UI-IPC", "BEGIN_SCAN accepted");
-            beginScan();
+            beginScan(ParseBeginScanSettings(command));
             await writer.WriteAsync("OK BEGIN_SCAN\n").ConfigureAwait(false);
             return;
         }
@@ -142,6 +143,7 @@ public sealed class ScannerPipeServer : IDisposable
         await writer.WriteLineAsync(FormattableString.Invariant($"revision {snapshot.Revision}")).ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"duplex {(snapshot.DuplexEnabled ? 1 : 0)}")).ConfigureAwait(false);
         await writer.WriteLineAsync($"pixel {snapshot.PixelType}").ConfigureAwait(false);
+        await writer.WriteLineAsync($"paper {snapshot.PaperSize}").ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"xres {snapshot.XResolution}")).ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"yres {snapshot.YResolution}")).ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"scan {(snapshot.ScanRequested ? 1 : 0)}")).ConfigureAwait(false);
@@ -151,5 +153,73 @@ public sealed class ScannerPipeServer : IDisposable
         }
 
         await writer.WriteLineAsync("END").ConfigureAwait(false);
+    }
+
+    private static ScannerSessionSettings? ParseBeginScanSettings(string command)
+    {
+        string[] tokens = command.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length <= 1)
+        {
+            return null;
+        }
+
+        bool duplexEnabled = false;
+        string pixelType = "RGB";
+        string paperSize = "A4";
+        int xResolution = 300;
+        int yResolution = 300;
+        bool sawSetting = false;
+
+        foreach (string token in tokens.Skip(1))
+        {
+            string[] parts = token.Split('=', 2);
+            if (parts.Length != 2)
+            {
+                continue;
+            }
+
+            switch (parts[0])
+            {
+                case "duplex":
+                    if (parts[1] is "0" or "1")
+                    {
+                        duplexEnabled = parts[1] == "1";
+                        sawSetting = true;
+                    }
+                    break;
+                case "pixel":
+                    if (parts[1] is "BW" or "GRAY" or "RGB")
+                    {
+                        pixelType = parts[1];
+                        sawSetting = true;
+                    }
+                    break;
+                case "paper":
+                    if (parts[1] is "A4" or "A3")
+                    {
+                        paperSize = parts[1];
+                        sawSetting = true;
+                    }
+                    break;
+                case "xres":
+                    if (int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out int parsedXResolution))
+                    {
+                        xResolution = parsedXResolution;
+                        sawSetting = true;
+                    }
+                    break;
+                case "yres":
+                    if (int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out int parsedYResolution))
+                    {
+                        yResolution = parsedYResolution;
+                        sawSetting = true;
+                    }
+                    break;
+            }
+        }
+
+        return sawSetting
+            ? new ScannerSessionSettings(duplexEnabled, pixelType, paperSize, xResolution, yResolution)
+            : null;
     }
 }

@@ -31,6 +31,7 @@ OK STATE
 revision 3
 duplex 1
 pixel RGB
+paper A3
 xres 300
 yres 300
 scan 1
@@ -43,7 +44,13 @@ END
 BEGIN_SCAN
 ```
 
-DS 在 TWAIN 宿主调用 `DAT_USERINTERFACE / MSG_ENABLEDS` 且允许显示 Source UI 时发送。UI 收到后开始一次新的扫描会话：清空上一次图片选择、清除 `scan` 标记、显示并置前窗口，等待用户添加图片并点击“开始扫描”。
+也可以携带 DS 当前能力设置：
+
+```text
+BEGIN_SCAN duplex=0 pixel=RGB paper=A3 xres=300 yres=300
+```
+
+DS 在 TWAIN 宿主调用 `DAT_USERINTERFACE / MSG_ENABLEDS` 且允许显示 Source UI 时发送。UI 收到后开始一次新的扫描会话：先应用随命令传入的当前设置，再清空上一次图片选择、清除 `scan` 标记、显示并置前窗口，等待用户添加图片并点击“开始扫描”。
 
 返回：
 
@@ -62,6 +69,7 @@ ACK_SCAN 3
 - `revision`：UI 状态版本，任意设置变化都会递增。
 - `duplex`：`0` 单面，`1` 双面。
 - `pixel`：`BW`、`GRAY`、`RGB`。
+- `paper`：纸张类型/尺寸，当前支持 `A4`、`A3`；DS 会映射到 TWAIN `ICAP_SUPPORTEDSIZES`。
 - `xres` / `yres`：当前 DPI。
 - `scan`：`1` 表示用户已点击“开始扫描”，DS 下一阶段会把它转为 `MSG_XFERREADY`。
 - `image`：一行一个待扫描图片路径，保持用户选择顺序。

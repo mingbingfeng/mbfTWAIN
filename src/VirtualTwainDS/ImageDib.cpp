@@ -1,9 +1,11 @@
 #include "ImageDib.h"
 
 #include <objbase.h>
+#include <propidl.h>
 #include <wincodec.h>
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 namespace
@@ -108,20 +110,75 @@ bool CreateFrame(
     return SUCCEEDED(decoder->GetFrame(0, frame.Put()));
 }
 
+UINT ReadExifOrientation(IWICBitmapFrameDecode* frame) noexcept
+{
+    if (frame == nullptr)
+    {
+        return 1;
+    }
+
+    ComPtr<IWICMetadataQueryReader> reader;
+    if (FAILED(frame->GetMetadataQueryReader(reader.Put())))
+    {
+        return 1;
+    }
+
+    const wchar_t* paths[] = {
+        L"/app1/ifd/{ushort=274}",
+        L"/ifd/{ushort=274}",
+    };
+
+    for (const wchar_t* path : paths)
+    {
+        PROPVARIANT value;
+        PropVariantInit(&value);
+        const HRESULT hr = reader->GetMetadataByName(path, &value);
+        if (SUCCEEDED(hr))
+        {
+            UINT orientation = 1;
+            switch (value.vt)
+            {
+            case VT_UI2:
+                orientation = value.uiVal;
+                break;
+            case VT_UI4:
+                orientation = value.ulVal;
+                break;
+            case VT_I4:
+                orientation = value.lVal > 0 ? static_cast<UINT>(value.lVal) : 1;
+                break;
+            default:
+                break;
+            }
+
+            PropVariantClear(&value);
+            return orientation >= 1 && orientation <= 8 ? orientation : 1;
+        }
+        PropVariantClear(&value);
+    }
+
+    return 1;
+}
+
+bool ExifOrientationSwapsDimensions(UINT orientation) noexcept
+{
+    return orientation >= 5 && orientation <= 8;
+}
+
 bool DecodeBgra(
     IWICImagingFactory* factory,
-    IWICBitmapFrameDecode* frame,
+    IWICBitmapSource* source,
     std::vector<BYTE>& pixels,
     UINT& width,
     UINT& height,
     UINT& stride) noexcept
 {
-    if (factory == nullptr || frame == nullptr)
+    if (factory == nullptr || source == nullptr)
     {
         return false;
     }
 
-    if (FAILED(frame->GetSize(&width, &height)) || width == 0 || height == 0)
+    if (FAILED(source->GetSize(&width, &height)) || width == 0 || height == 0)
     {
         return false;
     }
@@ -133,7 +190,7 @@ bool DecodeBgra(
     }
 
     if (FAILED(converter->Initialize(
-            frame,
+            source,
             GUID_WICPixelFormat32bppBGRA,
             WICBitmapDitherTypeNone,
             nullptr,
@@ -152,6 +209,102 @@ bool DecodeBgra(
         stride,
         static_cast<UINT>(pixels.size()),
         pixels.data()));
+}
+
+void MapExifOrientedPixel(
+    UINT orientation,
+    UINT destinationX,
+    UINT destinationY,
+    UINT sourceWidth,
+    UINT sourceHeight,
+    UINT& sourceX,
+    UINT& sourceY) noexcept
+{
+    switch (orientation)
+    {
+    case 2:
+        sourceX = sourceWidth - 1U - destinationX;
+        sourceY = destinationY;
+        break;
+    case 3:
+        sourceX = sourceWidth - 1U - destinationX;
+        sourceY = sourceHeight - 1U - destinationY;
+        break;
+    case 4:
+        sourceX = destinationX;
+        sourceY = sourceHeight - 1U - destinationY;
+        break;
+    case 5:
+        sourceX = destinationY;
+        sourceY = destinationX;
+        break;
+    case 6:
+        sourceX = destinationY;
+        sourceY = sourceHeight - 1U - destinationX;
+        break;
+    case 7:
+        sourceX = sourceWidth - 1U - destinationY;
+        sourceY = sourceHeight - 1U - destinationX;
+        break;
+    case 8:
+        sourceX = sourceWidth - 1U - destinationY;
+        sourceY = destinationX;
+        break;
+    case 1:
+    default:
+        sourceX = destinationX;
+        sourceY = destinationY;
+        break;
+    }
+}
+
+bool ApplyExifOrientationToBgra(
+    std::vector<BYTE>& pixels,
+    UINT& width,
+    UINT& height,
+    UINT& stride,
+    UINT orientation) noexcept
+{
+    if (orientation <= 1 || orientation > 8)
+    {
+        return true;
+    }
+
+    if (width == 0 || height == 0 || stride < width * 4U ||
+        pixels.size() < static_cast<size_t>(stride) * static_cast<size_t>(height))
+    {
+        return false;
+    }
+
+    const UINT sourceWidth = width;
+    const UINT sourceHeight = height;
+    const UINT sourceStride = stride;
+    const UINT destinationWidth = ExifOrientationSwapsDimensions(orientation) ? sourceHeight : sourceWidth;
+    const UINT destinationHeight = ExifOrientationSwapsDimensions(orientation) ? sourceWidth : sourceHeight;
+    const UINT destinationStride = destinationWidth * 4U;
+    std::vector<BYTE> oriented(
+        static_cast<size_t>(destinationStride) * static_cast<size_t>(destinationHeight));
+
+    for (UINT y = 0; y < destinationHeight; ++y)
+    {
+        BYTE* destinationRow = oriented.data() + (static_cast<size_t>(y) * destinationStride);
+        for (UINT x = 0; x < destinationWidth; ++x)
+        {
+            UINT sourceX = 0;
+            UINT sourceY = 0;
+            MapExifOrientedPixel(orientation, x, y, sourceWidth, sourceHeight, sourceX, sourceY);
+            const BYTE* sourcePixel = pixels.data() +
+                (static_cast<size_t>(sourceY) * sourceStride) +
+                (static_cast<size_t>(sourceX) * 4U);
+            std::memcpy(destinationRow + (static_cast<size_t>(x) * 4U), sourcePixel, 4U);
+        }
+    }
+
+    pixels.swap(oriented);
+    width = destinationWidth;
+    height = destinationHeight;
+    stride = destinationStride;
+    return true;
 }
 
 WORD BitsPerPixel(TW_UINT16 pixelType) noexcept
@@ -386,6 +539,11 @@ bool ImageDib::Probe(const std::wstring& path, DecodedImageInfo& info) noexcept
         return false;
     }
 
+    if (ExifOrientationSwapsDimensions(ReadExifOrientation(frame.Get())))
+    {
+        std::swap(width, height);
+    }
+
     info.width = width;
     info.height = height;
     return true;
@@ -418,7 +576,9 @@ bool ImageDib::BuildRaster(
     UINT width = 0;
     UINT height = 0;
     UINT sourceStride = 0;
-    if (!DecodeBgra(factory.Get(), frame.Get(), bgra, width, height, sourceStride))
+    const UINT orientation = ReadExifOrientation(frame.Get());
+    if (!DecodeBgra(factory.Get(), frame.Get(), bgra, width, height, sourceStride) ||
+        !ApplyExifOrientationToBgra(bgra, width, height, sourceStride, orientation))
     {
         return false;
     }
@@ -475,7 +635,9 @@ TW_HANDLE ImageDib::BuildNativeDib(
     UINT width = 0;
     UINT height = 0;
     UINT sourceStride = 0;
-    if (!DecodeBgra(factory.Get(), frame.Get(), bgra, width, height, sourceStride))
+    const UINT orientation = ReadExifOrientation(frame.Get());
+    if (!DecodeBgra(factory.Get(), frame.Get(), bgra, width, height, sourceStride) ||
+        !ApplyExifOrientationToBgra(bgra, width, height, sourceStride, orientation))
     {
         return nullptr;
     }

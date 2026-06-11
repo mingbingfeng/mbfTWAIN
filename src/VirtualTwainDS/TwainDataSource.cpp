@@ -55,7 +55,7 @@ constexpr std::array<TW_BOOL, 2> kDuplexValues = {FALSE, TRUE};
 constexpr std::array<TW_BOOL, 1> kTrueOnlyBoolValues = {TRUE};
 constexpr std::array<TW_UINT16, 3> kPixelTypeValues = {TWPT_BW, TWPT_GRAY, TWPT_RGB};
 constexpr std::array<TW_UINT16, 2> kTransferMechanismValues = {TWSX_NATIVE, TWSX_MEMORY};
-constexpr std::array<TW_UINT16, 1> kSupportedSizesValues = {TWSS_A4LETTER};
+constexpr std::array<TW_UINT16, 2> kSupportedSizesValues = {TWSS_A4LETTER, TWSS_A3};
 constexpr std::array<TW_INT16, 4> kResolutionWholeValues = {150, 200, 300, 600};
 
 constexpr TW_UINT32 kMutableCapabilitySupport =
@@ -385,6 +385,58 @@ bool TryMapPixelType(const std::wstring& value, TW_UINT16& pixelType) noexcept
     }
 
     return false;
+}
+
+bool TryMapPaperSize(const std::wstring& value, TW_UINT16& paperSize) noexcept
+{
+    if (value == L"A4" || value == L"A4LETTER")
+    {
+        paperSize = TWSS_A4LETTER;
+        return true;
+    }
+    if (value == L"A3")
+    {
+        paperSize = TWSS_A3;
+        return true;
+    }
+
+    return false;
+}
+
+std::wstring PixelTypeToProtocol(TW_UINT16 pixelType)
+{
+    switch (pixelType)
+    {
+    case TWPT_BW:
+        return L"BW";
+    case TWPT_GRAY:
+        return L"GRAY";
+    case TWPT_RGB:
+    default:
+        return L"RGB";
+    }
+}
+
+std::wstring PaperSizeToProtocol(TW_UINT16 paperSize)
+{
+    switch (paperSize)
+    {
+    case TWSS_A3:
+        return L"A3";
+    case TWSS_A4LETTER:
+    default:
+        return L"A4";
+    }
+}
+
+std::uint32_t Fix32WholeOrDefault(TW_FIX32 value, std::uint32_t fallback) noexcept
+{
+    if (value.Frac == 0 && value.Whole > 0)
+    {
+        return static_cast<std::uint32_t>(value.Whole);
+    }
+
+    return fallback;
 }
 
 bool FileExists(const std::wstring& path) noexcept
@@ -871,10 +923,7 @@ TW_UINT16 VirtualTwainDataSource::HandleIdentity(
         openOrigin_.reset();
         transferReady_ = false;
         transferReadyNotified_ = false;
-        pendingImages_.clear();
-        pendingIpcRevision_ = 0;
-        pendingTransferIndex_ = 0;
-        ResetMemoryTransfer();
+        ClearTransferProgress();
         return Succeed();
 
     default:
@@ -949,10 +998,7 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
 
         transferReady_ = false;
         transferReadyNotified_ = false;
-        pendingImages_.clear();
-        pendingIpcRevision_ = 0;
-        pendingTransferIndex_ = 0;
-        ResetMemoryTransfer();
+        ClearTransferProgress();
         state_ = TwainState::SourceEnabled;
 
         if (shouldShowUi && !BeginUiScanSession(true))
@@ -991,10 +1037,7 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
         transferReady_ = false;
         transferReadyNotified_ = false;
         StopTransferReadyWatcher();
-        pendingImages_.clear();
-        pendingIpcRevision_ = 0;
-        pendingTransferIndex_ = 0;
-        ResetMemoryTransfer();
+        ClearTransferProgress();
         state_ = TwainState::SourceOpened;
         return Succeed();
 
@@ -1085,12 +1128,14 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
         {
             transferReady_ = true;
             transferReadyNotified_ = false;
+            hasCurrentTransferImage_ = false;
             state_ = TwainState::TransferReady;
         }
         else
         {
             transferReady_ = false;
             transferReadyNotified_ = false;
+            hasCurrentTransferImage_ = false;
             ResetMemoryTransfer();
             state_ = TwainState::SourceEnabled;
             AcknowledgeScanIfComplete();
@@ -1109,6 +1154,8 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
         transferReadyNotified_ = false;
         pendingTransferIndex_ = 0;
         pendingImages_.clear();
+        hasCurrentTransferImage_ = false;
+        currentTransferImageIndex_ = 0;
         ResetMemoryTransfer();
         state_ = resetState;
         AcknowledgeScanIfComplete();
@@ -1203,7 +1250,9 @@ TW_UINT16 VirtualTwainDataSource::HandleImageInfo(TW_UINT16 message, TW_MEMREF d
         return Fail(TWCC_BADVALUE);
     }
 
-    if (!FillCurrentImageInfo(imageInfo))
+    TW_UINT32 imageIndex = 0;
+    if (!TryResolveImageInfoIndex(imageIndex) ||
+        !FillImageInfo(imageIndex, imageInfo))
     {
         return Fail(TWCC_OPERATIONERROR);
     }
@@ -1233,8 +1282,9 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(TW_UINT16 message, T
     }
 
     DecodedImageInfo decodedInfo{};
+    const TW_UINT32 imageIndex = pendingTransferIndex_;
     TW_HANDLE dib = ImageDib::BuildNativeDib(
-        pendingImages_[pendingTransferIndex_],
+        pendingImages_[imageIndex],
         settings_.pixelType,
         decodedInfo);
     if (dib == nullptr)
@@ -1244,6 +1294,8 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(TW_UINT16 message, T
 
     *outputHandle = dib;
     ++pendingTransferIndex_;
+    currentTransferImageIndex_ = imageIndex;
+    hasCurrentTransferImage_ = true;
     state_ = TwainState::Transferring;
     transferReady_ = pendingTransferIndex_ < pendingImages_.size();
     lastStatus_.ConditionCode = TWCC_SUCCESS;
@@ -1311,6 +1363,8 @@ TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(TW_UINT16 message, T
     transfer->BytesWritten = bytesToWrite;
 
     memoryTransfer_.nextRow += rowsToWrite;
+    currentTransferImageIndex_ = memoryTransfer_.imageIndex;
+    hasCurrentTransferImage_ = true;
     state_ = TwainState::Transferring;
     lastStatus_.ConditionCode = TWCC_SUCCESS;
     lastStatus_.Data = 0;
@@ -1463,12 +1517,13 @@ TW_UINT16 VirtualTwainDataSource::GetCapability(TW_UINT16 message, pTW_CAPABILIT
                 TWTY_UINT16,
                 kSupportedSizesValues.data(),
                 static_cast<TW_UINT32>(kSupportedSizesValues.size()),
-                0,
+                IndexOf(kSupportedSizesValues, settings_.paperSize, 0),
                 0);
         }
         else
         {
-            container = BuildOneValue(TWTY_UINT16, TWSS_A4LETTER);
+            const TW_UINT16 value = message == MSG_GETDEFAULT ? TWSS_A4LETTER : settings_.paperSize;
+            container = BuildOneValue(TWTY_UINT16, value);
         }
         break;
 
@@ -1618,10 +1673,12 @@ TW_UINT16 VirtualTwainDataSource::SetCapability(pTW_CAPABILITY capability)
         {
             return Fail(TWCC_CAPBADOPERATION);
         }
-        if (static_cast<TW_UINT16>(packedItem) != TWSS_A4LETTER)
+        const auto value = static_cast<TW_UINT16>(packedItem);
+        if (std::find(kSupportedSizesValues.begin(), kSupportedSizesValues.end(), value) == kSupportedSizesValues.end())
         {
             return Fail(TWCC_BADVALUE);
         }
+        settings_.paperSize = value;
         return Succeed();
     }
 
@@ -1720,6 +1777,7 @@ TW_UINT16 VirtualTwainDataSource::ResetAllCapabilities() noexcept
 {
     settings_.duplexEnabled = FALSE;
     settings_.pixelType = TWPT_RGB;
+    settings_.paperSize = TWSS_A4LETTER;
     settings_.xResolution = MakeFix32(300);
     settings_.yResolution = MakeFix32(300);
     settings_.transferMechanism = TWSX_NATIVE;
@@ -1744,13 +1802,15 @@ TW_UINT16 VirtualTwainDataSource::ResetCapabilityValue(TW_UINT16 capability) noe
     case ICAP_PIXELTYPE:
         settings_.pixelType = TWPT_RGB;
         return Succeed();
+    case ICAP_SUPPORTEDSIZES:
+        settings_.paperSize = TWSS_A4LETTER;
+        return Succeed();
     case ICAP_XRESOLUTION:
         settings_.xResolution = MakeFix32(300);
         return Succeed();
     case ICAP_YRESOLUTION:
         settings_.yResolution = MakeFix32(300);
         return Succeed();
-    case ICAP_SUPPORTEDSIZES:
     case ICAP_AUTOMATICBORDERDETECTION:
     case ICAP_AUTOMATICDESKEW:
         return Succeed();
@@ -1781,6 +1841,7 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
             L" scan=" + std::to_wstring(ipcState.scanRequested ? 1U : 0U) +
             L" images=" + std::to_wstring(ipcState.selectedImages.size()) +
             L" pixel=" + ipcState.pixelType +
+            L" paper=" + ipcState.paperSize +
             L" xres=" + std::to_wstring(ipcState.xResolution) +
             L" yres=" + std::to_wstring(ipcState.yResolution));
 
@@ -1804,6 +1865,12 @@ void VirtualTwainDataSource::ApplyScannerSettingsFromIpc(const ScannerIpcState& 
         settings_.pixelType = mappedPixelType;
     }
 
+    TW_UINT16 mappedPaperSize = settings_.paperSize;
+    if (TryMapPaperSize(ipcState.paperSize, mappedPaperSize))
+    {
+        settings_.paperSize = mappedPaperSize;
+    }
+
     const auto xResolution = MakeFix32(static_cast<TW_INT16>(ipcState.xResolution));
     if (ContainsFix32WholeValue(xResolution))
     {
@@ -1823,6 +1890,8 @@ void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcSta
 {
     pendingIpcRevision_ = ipcState.revision;
     pendingTransferIndex_ = 0;
+    hasCurrentTransferImage_ = false;
+    currentTransferImageIndex_ = 0;
     transferReadyNotified_ = false;
     ResetMemoryTransfer();
     pendingImages_ = std::move(ipcState.selectedImages);
@@ -2066,7 +2135,14 @@ bool VirtualTwainDataSource::BeginUiScanSession(bool shouldShowUi)
     }
 
     ScannerIpcClient client;
-    if (client.BeginScan(250))
+    ScannerIpcState initialState{};
+    initialState.duplexEnabled = settings_.duplexEnabled != FALSE;
+    initialState.pixelType = PixelTypeToProtocol(settings_.pixelType);
+    initialState.paperSize = PaperSizeToProtocol(settings_.paperSize);
+    initialState.xResolution = Fix32WholeOrDefault(settings_.xResolution, 300);
+    initialState.yResolution = Fix32WholeOrDefault(settings_.yResolution, 300);
+
+    if (client.BeginScan(initialState, 250))
     {
         diagnostics::AppendLine(L"DS", L"BeginUiScanSession succeeded against existing UI process");
         return true;
@@ -2082,7 +2158,7 @@ bool VirtualTwainDataSource::BeginUiScanSession(bool shouldShowUi)
 
     for (int attempt = 0; attempt < 50; ++attempt)
     {
-        if (client.BeginScan(100))
+        if (client.BeginScan(initialState, 100))
         {
             diagnostics::AppendLine(
                 L"DS",
@@ -2147,15 +2223,32 @@ bool VirtualTwainDataSource::LaunchScannerUiProcess() const
     return true;
 }
 
-bool VirtualTwainDataSource::FillCurrentImageInfo(pTW_IMAGEINFO imageInfo)
+bool VirtualTwainDataSource::TryResolveImageInfoIndex(TW_UINT32& imageIndex) const noexcept
 {
-    if (imageInfo == nullptr || pendingTransferIndex_ >= pendingImages_.size())
+    if (state_ == TwainState::Transferring && hasCurrentTransferImage_)
+    {
+        imageIndex = currentTransferImageIndex_;
+        return imageIndex < pendingImages_.size();
+    }
+
+    if (state_ == TwainState::TransferReady)
+    {
+        imageIndex = pendingTransferIndex_;
+        return imageIndex < pendingImages_.size();
+    }
+
+    return false;
+}
+
+bool VirtualTwainDataSource::FillImageInfo(TW_UINT32 imageIndex, pTW_IMAGEINFO imageInfo)
+{
+    if (imageInfo == nullptr || imageIndex >= pendingImages_.size())
     {
         return false;
     }
 
     DecodedImageInfo decodedInfo{};
-    if (!ImageDib::Probe(pendingImages_[pendingTransferIndex_], decodedInfo))
+    if (!ImageDib::Probe(pendingImages_[imageIndex], decodedInfo))
     {
         return false;
     }
@@ -2229,6 +2322,16 @@ void VirtualTwainDataSource::ResetMemoryTransfer() noexcept
     memoryTransfer_.imageIndex = 0;
     memoryTransfer_.nextRow = 0;
     memoryTransfer_.image = RasterImage{};
+}
+
+void VirtualTwainDataSource::ClearTransferProgress() noexcept
+{
+    pendingImages_.clear();
+    pendingIpcRevision_ = 0;
+    pendingTransferIndex_ = 0;
+    hasCurrentTransferImage_ = false;
+    currentTransferImageIndex_ = 0;
+    ResetMemoryTransfer();
 }
 
 void VirtualTwainDataSource::AcknowledgeScanIfComplete()

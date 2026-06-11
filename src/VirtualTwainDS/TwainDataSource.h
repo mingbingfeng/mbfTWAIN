@@ -51,6 +51,7 @@ private:
     {
         TW_BOOL duplexEnabled = FALSE;
         TW_UINT16 pixelType = TWPT_RGB;
+        TW_UINT16 paperSize = TWSS_A4LETTER;
         TW_FIX32 xResolution{};
         TW_FIX32 yResolution{};
         TW_UINT16 transferMechanism = TWSX_NATIVE;
@@ -97,9 +98,11 @@ private:
     void TransferReadyWatcherLoop();
     bool BeginUiScanSession(bool shouldShowUi);
     bool LaunchScannerUiProcess() const;
-    bool FillCurrentImageInfo(pTW_IMAGEINFO imageInfo);
+    bool FillImageInfo(TW_UINT32 imageIndex, pTW_IMAGEINFO imageInfo);
+    bool TryResolveImageInfoIndex(TW_UINT32& imageIndex) const noexcept;
     bool EnsureMemoryTransferReady();
     void ResetMemoryTransfer() noexcept;
+    void ClearTransferProgress() noexcept;
     void AcknowledgeScanIfComplete();
 
     TW_UINT16 Succeed(TW_UINT16 conditionCode = TWCC_SUCCESS) noexcept;
@@ -118,6 +121,8 @@ private:
     bool transferReadyNotified_ = false;
     std::uint32_t pendingIpcRevision_ = 0;
     TW_UINT32 pendingTransferIndex_ = 0;
+    bool hasCurrentTransferImage_ = false;
+    TW_UINT32 currentTransferImageIndex_ = 0;
     std::vector<std::wstring> pendingImages_;
     MemoryTransferState memoryTransfer_{};
     TW_ENTRYPOINT entryPoint_{};

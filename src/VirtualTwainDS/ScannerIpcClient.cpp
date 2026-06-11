@@ -13,6 +13,7 @@ namespace
 {
 
 std::wstring Utf8ToWide(const std::string& value);
+std::string WideToUtf8(const std::wstring& value);
 
 std::wstring CommandName(const std::string& command)
 {
@@ -54,6 +55,40 @@ std::wstring Utf8ToWide(const std::string& value)
         static_cast<int>(value.size()),
         result.data(),
         length);
+    return result;
+}
+
+std::string WideToUtf8(const std::wstring& value)
+{
+    if (value.empty())
+    {
+        return {};
+    }
+
+    const int length = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (length <= 0)
+    {
+        return {};
+    }
+
+    std::string result(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        result.data(),
+        length,
+        nullptr,
+        nullptr);
     return result;
 }
 
@@ -130,6 +165,7 @@ bool ParseStateResponse(const std::string& response, mbf::twain::ScannerIpcState
         const std::string_view kRevision("revision ", 9);
         const std::string_view kDuplex("duplex ", 7);
         const std::string_view kPixel("pixel ", 6);
+        const std::string_view kPaper("paper ", 6);
         const std::string_view kXRes("xres ", 5);
         const std::string_view kYRes("yres ", 5);
         const std::string_view kScan("scan ", 5);
@@ -148,6 +184,10 @@ bool ParseStateResponse(const std::string& response, mbf::twain::ScannerIpcState
         else if (StartsWith(line, kPixel))
         {
             parsed.pixelType = Utf8ToWide(line.substr(kPixel.size()));
+        }
+        else if (StartsWith(line, kPaper))
+        {
+            parsed.paperSize = Utf8ToWide(line.substr(kPaper.size()));
         }
         else if (StartsWith(line, kXRes) && ParseUInt32(std::string_view(line).substr(kXRes.size()), number))
         {
@@ -196,6 +236,22 @@ bool ScannerIpcClient::BeginScan(DWORD timeoutMilliseconds) const
 {
     std::string response;
     return SendCommand("BEGIN_SCAN\n", response, timeoutMilliseconds) &&
+           response == "OK BEGIN_SCAN\n";
+}
+
+bool ScannerIpcClient::BeginScan(const ScannerIpcState& initialState, DWORD timeoutMilliseconds) const
+{
+    std::ostringstream command;
+    command << "BEGIN_SCAN"
+            << " duplex=" << (initialState.duplexEnabled ? "1" : "0")
+            << " pixel=" << WideToUtf8(initialState.pixelType)
+            << " paper=" << WideToUtf8(initialState.paperSize)
+            << " xres=" << initialState.xResolution
+            << " yres=" << initialState.yResolution
+            << "\n";
+
+    std::string response;
+    return SendCommand(command.str(), response, timeoutMilliseconds) &&
            response == "OK BEGIN_SCAN\n";
 }
 

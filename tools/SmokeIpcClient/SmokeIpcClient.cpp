@@ -19,10 +19,11 @@ int wmain()
     }
 
     std::printf(
-        "revision=%lu duplex=%u pixel=%ls xres=%lu yres=%lu scan=%u images=%zu\n",
+        "revision=%lu duplex=%u pixel=%ls paper=%ls xres=%lu yres=%lu scan=%u images=%zu\n",
         static_cast<unsigned long>(state.revision),
         state.duplexEnabled ? 1U : 0U,
         state.pixelType.c_str(),
+        state.paperSize.c_str(),
         static_cast<unsigned long>(state.xResolution),
         static_cast<unsigned long>(state.yResolution),
         state.scanRequested ? 1U : 0U,
