@@ -9,10 +9,12 @@
 
 #include <windows.h>
 
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ImageDib.h"
@@ -20,6 +22,8 @@
 
 namespace mbf::twain
 {
+
+struct ScannerIpcState;
 
 enum class TwainState : TW_UINT16
 {
@@ -62,6 +66,7 @@ private:
     };
 
     VirtualTwainDataSource();
+    ~VirtualTwainDataSource();
 
     TW_UINT16 HandleIdentity(TW_UINT16 message, pTW_IDENTITY origin, TW_MEMREF data);
     TW_UINT16 HandleCapability(TW_UINT16 message, TW_MEMREF data);
@@ -69,6 +74,7 @@ private:
     TW_UINT16 HandleEvent(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandlePendingTransfers(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleSetupMemoryTransfer(TW_UINT16 message, TW_MEMREF data);
+    TW_UINT16 HandleTransferGroup(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleEntryPoint(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleImage(TW_UINT16 dataArgumentType, TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleImageInfo(TW_UINT16 message, TW_MEMREF data);
@@ -83,7 +89,12 @@ private:
     TW_UINT16 ResetAllCapabilities() noexcept;
     TW_UINT16 ResetCapabilityValue(TW_UINT16 capability) noexcept;
     bool RefreshTransferReadyFromIpc();
+    void ApplyScannerSettingsFromIpc(const ScannerIpcState& ipcState);
+    void CommitTransferReadyFromIpc(ScannerIpcState&& ipcState);
     bool NotifyTransferReady();
+    void StartTransferReadyWatcher();
+    void StopTransferReadyWatcher();
+    void TransferReadyWatcherLoop();
     bool BeginUiScanSession(bool shouldShowUi);
     bool LaunchScannerUiProcess() const;
     bool FillCurrentImageInfo(pTW_IMAGEINFO imageInfo);
@@ -111,6 +122,11 @@ private:
     MemoryTransferState memoryTransfer_{};
     TW_ENTRYPOINT entryPoint_{};
     std::optional<TW_IDENTITY> openOrigin_;
+    std::condition_variable transferReadyWatcherCv_;
+    std::thread transferReadyWatcher_;
+    bool transferReadyWatcherStop_ = false;
+    bool transferReadyWatcherActive_ = false;
+    std::uint64_t transferReadyWatcherGeneration_ = 0;
 };
 
 } // namespace mbf::twain

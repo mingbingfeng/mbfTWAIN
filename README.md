@@ -72,6 +72,11 @@ With the fake server already listening, set `MBF_SMOKE_EXPECT_XFERREADY=1` and
 run `SmokeDsEntry.exe` against the built `.ds`. Set `MBF_SMOKE_USE_MEMORY=1` as
 well to exercise `DAT_IMAGEMEMXFER` instead of `DAT_IMAGENATIVEXFER`.
 
+To exercise the UI-style delayed-ready path, start the fake server with
+`--scan 0 --scan-after-begin-delay-ms 200 --connections 40`, then also set
+`MBF_SMOKE_EXPECT_ENABLE_CALLBACK=1`. That asserts the DS raises
+`DAT_NULL/MSG_XFERREADY` before the first explicit `DAT_EVENT` poll.
+
 ## Runtime UI
 
 When a TWAIN host calls `DAT_USERINTERFACE / MSG_ENABLEDS` with `ShowUI=TRUE`,

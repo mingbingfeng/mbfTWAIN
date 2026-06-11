@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,7 +34,7 @@ constexpr std::array<TW_UINT16, 14> kSupportedCapabilities = {
     ICAP_XFERMECH,
 };
 
-constexpr std::array<TW_UINT32, 13> kSupportedDataArgumentTypes = {
+constexpr std::array<TW_UINT32, 14> kSupportedDataArgumentTypes = {
     (DG_CONTROL << 16) | DAT_CAPABILITY,
     (DG_CONTROL << 16) | DAT_ENTRYPOINT,
     (DG_CONTROL << 16) | DAT_EVENT,
@@ -42,6 +43,7 @@ constexpr std::array<TW_UINT32, 13> kSupportedDataArgumentTypes = {
     (DG_CONTROL << 16) | DAT_SETUPMEMXFER,
     (DG_CONTROL << 16) | DAT_STATUS,
     (DG_CONTROL << 16) | DAT_USERINTERFACE,
+    (DG_CONTROL << 16) | DAT_XFERGROUP,
     (DG_IMAGE << 16) | DAT_IMAGEINFO,
     (DG_IMAGE << 16) | DAT_IMAGEMEMXFER,
     (DG_IMAGE << 16) | DAT_IMAGENATIVEXFER,
@@ -614,6 +616,8 @@ std::wstring DataArgumentTypeName(TW_UINT16 dataArgumentType)
         return L"DAT_CAPABILITY";
     case DAT_USERINTERFACE:
         return L"DAT_USERINTERFACE";
+    case DAT_XFERGROUP:
+        return L"DAT_XFERGROUP";
     case DAT_EVENT:
         return L"DAT_EVENT";
     case DAT_PENDINGXFERS:
@@ -729,6 +733,22 @@ VirtualTwainDataSource::VirtualTwainDataSource()
         L"VirtualTwainDataSource initialized logPath=" + diagnostics::LogFilePath());
 }
 
+VirtualTwainDataSource::~VirtualTwainDataSource()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        transferReadyWatcherStop_ = true;
+        transferReadyWatcherActive_ = false;
+        ++transferReadyWatcherGeneration_;
+    }
+
+    transferReadyWatcherCv_.notify_all();
+    if (transferReadyWatcher_.joinable())
+    {
+        transferReadyWatcher_.join();
+    }
+}
+
 TW_UINT16 VirtualTwainDataSource::Entry(
     pTW_IDENTITY origin,
     TW_UINT32 dataGroup,
@@ -773,6 +793,9 @@ TW_UINT16 VirtualTwainDataSource::Entry(
             break;
         case DAT_SETUPMEMXFER:
             result = HandleSetupMemoryTransfer(message, data);
+            break;
+        case DAT_XFERGROUP:
+            result = HandleTransferGroup(message, data);
             break;
         case DAT_STATUS:
             result = HandleStatus(message, data);
@@ -844,6 +867,7 @@ TW_UINT16 VirtualTwainDataSource::HandleIdentity(
         }
 
         state_ = TwainState::SourceLoaded;
+        StopTransferReadyWatcher();
         openOrigin_.reset();
         transferReady_ = false;
         transferReadyNotified_ = false;
@@ -946,6 +970,10 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
             state_ = TwainState::TransferReady;
             NotifyTransferReady();
         }
+        else if (shouldShowUi && message == MSG_ENABLEDS)
+        {
+            StartTransferReadyWatcher();
+        }
 
         return Succeed();
     }
@@ -962,6 +990,7 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
 
         transferReady_ = false;
         transferReadyNotified_ = false;
+        StopTransferReadyWatcher();
         pendingImages_.clear();
         pendingIpcRevision_ = 0;
         pendingTransferIndex_ = 0;
@@ -1002,7 +1031,6 @@ TW_UINT16 VirtualTwainDataSource::HandleEvent(TW_UINT16 message, TW_MEMREF data)
     {
         state_ = TwainState::TransferReady;
         event->TWMessage = MSG_XFERREADY;
-        NotifyTransferReady();
         lastStatus_.ConditionCode = TWCC_SUCCESS;
         lastStatus_.Data = 0;
         return TWRC_DSEVENT;
@@ -1023,6 +1051,22 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
 
     switch (message)
     {
+    case MSG_GET:
+    {
+        if (state_ != TwainState::TransferReady && state_ != TwainState::Transferring)
+        {
+            return Fail(TWCC_SEQERROR);
+        }
+
+        const TW_UINT32 remaining =
+            pendingTransferIndex_ < pendingImages_.size()
+                ? static_cast<TW_UINT32>(pendingImages_.size() - pendingTransferIndex_)
+                : 0;
+        pendingTransfers->Count = static_cast<TW_UINT16>((std::min)(remaining, static_cast<TW_UINT32>(0xffff)));
+        pendingTransfers->EOJ = 0;
+        return Succeed();
+    }
+
     case MSG_ENDXFER:
     {
         if (state_ != TwainState::Transferring && state_ != TwainState::TransferReady)
@@ -1071,6 +1115,31 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
         return Succeed();
     }
 
+    default:
+        return Fail(TWCC_BADPROTOCOL);
+    }
+}
+
+TW_UINT16 VirtualTwainDataSource::HandleTransferGroup(TW_UINT16 message, TW_MEMREF data)
+{
+    if (!IsAtLeast(TwainState::SourceOpened))
+    {
+        return Fail(TWCC_SEQERROR);
+    }
+
+    auto* transferGroup = static_cast<pTW_UINT32>(data);
+    if (transferGroup == nullptr)
+    {
+        return Fail(TWCC_BADVALUE);
+    }
+
+    switch (message)
+    {
+    case MSG_GET:
+        *transferGroup = DG_IMAGE;
+        return Succeed();
+    case MSG_SET:
+        return *transferGroup == DG_IMAGE ? Succeed() : Fail(TWCC_BADVALUE);
     default:
         return Fail(TWCC_BADPROTOCOL);
     }
@@ -1715,6 +1784,20 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
             L" xres=" + std::to_wstring(ipcState.xResolution) +
             L" yres=" + std::to_wstring(ipcState.yResolution));
 
+    ApplyScannerSettingsFromIpc(ipcState);
+
+    if (!ipcState.scanRequested || ipcState.selectedImages.empty())
+    {
+        diagnostics::AppendLine(L"DS", L"Transfer not ready yet: scanRequested=0 or no images selected");
+        return false;
+    }
+
+    CommitTransferReadyFromIpc(std::move(ipcState));
+    return true;
+}
+
+void VirtualTwainDataSource::ApplyScannerSettingsFromIpc(const ScannerIpcState& ipcState)
+{
     TW_UINT16 mappedPixelType = settings_.pixelType;
     if (TryMapPixelType(ipcState.pixelType, mappedPixelType))
     {
@@ -1734,13 +1817,10 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
     }
 
     settings_.duplexEnabled = ipcState.duplexEnabled ? TRUE : FALSE;
+}
 
-    if (!ipcState.scanRequested || ipcState.selectedImages.empty())
-    {
-        diagnostics::AppendLine(L"DS", L"Transfer not ready yet: scanRequested=0 or no images selected");
-        return false;
-    }
-
+void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcState)
+{
     pendingIpcRevision_ = ipcState.revision;
     pendingTransferIndex_ = 0;
     transferReadyNotified_ = false;
@@ -1750,7 +1830,6 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
         L"DS",
         L"Transfer ready from IPC revision=" + std::to_wstring(pendingIpcRevision_) +
             L" imageCount=" + std::to_wstring(pendingImages_.size()));
-    return true;
 }
 
 bool VirtualTwainDataSource::NotifyTransferReady()
@@ -1773,7 +1852,6 @@ bool VirtualTwainDataSource::NotifyTransferReady()
         return false;
     }
 
-    transferReadyNotified_ = true;
     TW_IDENTITY sourceIdentity = identity_;
     TW_IDENTITY appIdentity = *openOrigin_;
     const TW_UINT16 rc = entryPoint_.DSM_Entry(
@@ -1789,7 +1867,194 @@ bool VirtualTwainDataSource::NotifyTransferReady()
         L"NotifyTransferReady DAT_NULL/MSG_XFERREADY rc=" + std::to_wstring(rc) +
             L" sourceId=" + std::to_wstring(sourceIdentity.Id) +
             L" appId=" + std::to_wstring(appIdentity.Id));
-    return rc == TWRC_SUCCESS;
+    if (rc == TWRC_SUCCESS)
+    {
+        transferReadyNotified_ = true;
+        return true;
+    }
+
+    return false;
+}
+
+void VirtualTwainDataSource::StartTransferReadyWatcher()
+{
+    if (!transferReadyWatcher_.joinable())
+    {
+        transferReadyWatcher_ = std::thread(&VirtualTwainDataSource::TransferReadyWatcherLoop, this);
+    }
+
+    transferReadyWatcherActive_ = true;
+    ++transferReadyWatcherGeneration_;
+    diagnostics::AppendLine(
+        L"DS",
+        L"Transfer ready watcher started generation=" +
+            std::to_wstring(transferReadyWatcherGeneration_));
+    transferReadyWatcherCv_.notify_all();
+}
+
+void VirtualTwainDataSource::StopTransferReadyWatcher()
+{
+    if (!transferReadyWatcherActive_)
+    {
+        return;
+    }
+
+    transferReadyWatcherActive_ = false;
+    ++transferReadyWatcherGeneration_;
+    diagnostics::AppendLine(
+        L"DS",
+        L"Transfer ready watcher stopped generation=" +
+            std::to_wstring(transferReadyWatcherGeneration_));
+    transferReadyWatcherCv_.notify_all();
+}
+
+void VirtualTwainDataSource::TransferReadyWatcherLoop()
+{
+    ScannerIpcClient client;
+    bool loggedState = false;
+    std::uint32_t lastRevision = 0;
+    bool lastScanRequested = false;
+    size_t lastImageCount = 0;
+    std::uint64_t loggedGeneration = 0;
+
+    diagnostics::AppendLine(L"DS", L"Transfer ready watcher thread entered");
+
+    for (;;)
+    {
+        std::uint64_t generation = 0;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            transferReadyWatcherCv_.wait(lock, [this]
+            {
+                return transferReadyWatcherStop_ || transferReadyWatcherActive_;
+            });
+
+            if (transferReadyWatcherStop_)
+            {
+                break;
+            }
+
+            generation = transferReadyWatcherGeneration_;
+            if (state_ != TwainState::SourceEnabled || transferReady_)
+            {
+                transferReadyWatcherActive_ = false;
+                ++transferReadyWatcherGeneration_;
+                diagnostics::AppendLine(
+                    L"DS",
+                    L"Transfer ready watcher paused because state=" + TwainStateName(state_) +
+                        L" transferReady=" + std::to_wstring(transferReady_ ? 1U : 0U));
+                continue;
+            }
+        }
+
+        ScannerIpcState ipcState{};
+        if (!client.TryGetState(ipcState, 150))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(75));
+            continue;
+        }
+
+        bool shouldNotify = false;
+        std::uint32_t notificationRevision = 0;
+        TW_ENTRYPOINT notificationEntryPoint{};
+        TW_IDENTITY notificationSourceIdentity{};
+        TW_IDENTITY notificationAppIdentity{};
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (transferReadyWatcherStop_ ||
+                !transferReadyWatcherActive_ ||
+                generation != transferReadyWatcherGeneration_ ||
+                state_ != TwainState::SourceEnabled ||
+                transferReady_)
+            {
+                continue;
+            }
+
+            ApplyScannerSettingsFromIpc(ipcState);
+
+            if (!loggedState ||
+                loggedGeneration != generation ||
+                ipcState.revision != lastRevision ||
+                ipcState.scanRequested != lastScanRequested ||
+                ipcState.selectedImages.size() != lastImageCount)
+            {
+                diagnostics::AppendLine(
+                    L"DS",
+                    L"Transfer ready watcher revision=" + std::to_wstring(ipcState.revision) +
+                        L" scan=" + std::to_wstring(ipcState.scanRequested ? 1U : 0U) +
+                        L" images=" + std::to_wstring(ipcState.selectedImages.size()) +
+                        L" pixel=" + ipcState.pixelType +
+                        L" xres=" + std::to_wstring(ipcState.xResolution) +
+                        L" yres=" + std::to_wstring(ipcState.yResolution));
+                loggedState = true;
+                lastRevision = ipcState.revision;
+                lastScanRequested = ipcState.scanRequested;
+                lastImageCount = ipcState.selectedImages.size();
+                loggedGeneration = generation;
+            }
+
+            if (ipcState.scanRequested && !ipcState.selectedImages.empty())
+            {
+                CommitTransferReadyFromIpc(std::move(ipcState));
+                transferReady_ = true;
+                state_ = TwainState::TransferReady;
+                transferReadyWatcherActive_ = false;
+                ++transferReadyWatcherGeneration_;
+
+                if (entryPoint_.DSM_Entry == nullptr)
+                {
+                    diagnostics::AppendLine(L"DS", L"NotifyTransferReady skipped because DSM_Entry is null");
+                }
+                else if (!openOrigin_)
+                {
+                    diagnostics::AppendLine(L"DS", L"NotifyTransferReady skipped because app identity is missing");
+                }
+                else if (transferReadyNotified_)
+                {
+                    diagnostics::AppendLine(L"DS", L"NotifyTransferReady skipped because already notified");
+                }
+                else
+                {
+                    shouldNotify = true;
+                    notificationRevision = pendingIpcRevision_;
+                    notificationEntryPoint = entryPoint_;
+                    notificationSourceIdentity = identity_;
+                    notificationAppIdentity = *openOrigin_;
+                }
+            }
+        }
+
+        if (shouldNotify)
+        {
+            const TW_UINT16 rc = notificationEntryPoint.DSM_Entry(
+                &notificationSourceIdentity,
+                &notificationAppIdentity,
+                DG_CONTROL,
+                DAT_NULL,
+                MSG_XFERREADY,
+                nullptr);
+
+            diagnostics::AppendLine(
+                L"DS",
+                L"NotifyTransferReady DAT_NULL/MSG_XFERREADY rc=" + std::to_wstring(rc) +
+                    L" sourceId=" + std::to_wstring(notificationSourceIdentity.Id) +
+                    L" appId=" + std::to_wstring(notificationAppIdentity.Id));
+
+            if (rc == TWRC_SUCCESS)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (pendingIpcRevision_ == notificationRevision)
+                {
+                    transferReadyNotified_ = true;
+                }
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    diagnostics::AppendLine(L"DS", L"Transfer ready watcher thread exiting");
 }
 
 bool VirtualTwainDataSource::BeginUiScanSession(bool shouldShowUi)

@@ -43,6 +43,23 @@ function Invoke-Checked([scriptblock]$Command, [string]$Label) {
     }
 }
 
+function Invoke-WithTemporaryEnvironment([hashtable]$Variables, [scriptblock]$Action) {
+    $originalValues = @{}
+    foreach ($entry in $Variables.GetEnumerator()) {
+        $originalValues[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+
+    try {
+        & $Action
+    }
+    finally {
+        foreach ($entry in $originalValues.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+    }
+}
+
 function Get-VsWherePath {
     $path = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path -LiteralPath $path -PathType Leaf) {
@@ -266,9 +283,71 @@ function Run-Smoke([string]$Platform) {
     Assert-File $smokePath "SmokeDsEntry missing"
 
     Write-Step "Smoke test $Platform"
-    Invoke-Checked {
-        & $smokePath $dsPath
-    } "$Platform SmokeDsEntry"
+    Invoke-WithTemporaryEnvironment @{
+        MBF_TWAIN_FORCE_UI = "0"
+        MBF_SMOKE_EXPECT_XFERREADY = $null
+        MBF_SMOKE_EXPECT_ENABLE_CALLBACK = $null
+        MBF_SMOKE_USE_MEMORY = $null
+    } {
+        Invoke-Checked {
+            & $smokePath $dsPath
+        } "$Platform SmokeDsEntry"
+    }
+}
+
+function Run-UiDelayedReadySmoke([string]$Platform) {
+    $outDir = Join-Path $Root "build\manual\$Platform\$Configuration"
+    $dsPath = Join-Path $outDir "mbfVirtualTwainDS.ds"
+    $smokePath = Join-Path $outDir "SmokeDsEntry.exe"
+    $fakeServerDll = Join-Path $Root "tools\FakeScannerPipeServer\bin\$Configuration\net10.0\mbfTwain.FakeScannerPipeServer.dll"
+    $imagePath = Join-Path $Root "build\test-assets\page1.bmp"
+    $stdoutLog = Join-Path $Root "build\verify-$Platform-ui-delayed.out.log"
+    $stderrLog = Join-Path $Root "build\verify-$Platform-ui-delayed.err.log"
+    Assert-File $dsPath "DS missing"
+    Assert-File $smokePath "SmokeDsEntry missing"
+    Assert-File $fakeServerDll "FakeScannerPipeServer missing"
+    Assert-File $imagePath "Delayed-ready smoke image missing"
+
+    Get-Process -Name "mbfTwain.VirtualScannerConfig" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
+    Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
+
+    $server = Start-Process `
+        -FilePath "dotnet" `
+        -ArgumentList @(
+            $fakeServerDll,
+            "--image", $imagePath,
+            "--scan", "0",
+            "--scan-after-begin-delay-ms", "200",
+            "--connections", "80",
+            "--revision", "42"
+        ) `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -PassThru `
+        -WindowStyle Hidden
+
+    try {
+        Start-Sleep -Milliseconds 150
+        Write-Step "UI delayed-ready smoke $Platform"
+        Invoke-WithTemporaryEnvironment @{
+            MBF_TWAIN_FORCE_UI = "1"
+            MBF_SMOKE_EXPECT_XFERREADY = "1"
+            MBF_SMOKE_EXPECT_ENABLE_CALLBACK = "1"
+            MBF_SMOKE_USE_MEMORY = $null
+        } {
+            Invoke-Checked {
+                & $smokePath $dsPath
+            } "$Platform delayed-ready SmokeDsEntry"
+        }
+    }
+    finally {
+        if ($null -ne $server -and -not $server.HasExited) {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            $server.WaitForExit()
+        }
+    }
 }
 
 function Install-Platform([string]$Platform, [string]$Destination) {
@@ -335,6 +414,8 @@ try {
     if (-not $SkipSmoke) {
         Run-Smoke "x64"
         Run-Smoke "Win32"
+        Run-UiDelayedReadySmoke "x64"
+        Run-UiDelayedReadySmoke "Win32"
     }
 
     Install-LocalTwain

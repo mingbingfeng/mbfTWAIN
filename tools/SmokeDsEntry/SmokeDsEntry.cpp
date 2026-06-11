@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -24,9 +25,9 @@ using DsEntry = TW_UINT16(TW_CALLINGSTYLE*)(
     TW_UINT16 message,
     TW_MEMREF data);
 
-bool g_sawXferReadyCallback = false;
-TW_UINT32 g_xferReadySourceId = 0;
-TW_UINT32 g_xferReadyAppId = 0;
+std::atomic_bool g_sawXferReadyCallback{false};
+std::atomic<TW_UINT32> g_xferReadySourceId{0};
+std::atomic<TW_UINT32> g_xferReadyAppId{0};
 
 TW_UINT16 TW_CALLINGSTYLE SmokeDsmEntry(
     pTW_IDENTITY origin,
@@ -42,9 +43,9 @@ TW_UINT16 TW_CALLINGSTYLE SmokeDsmEntry(
         dataArgumentType == DAT_NULL &&
         message == MSG_XFERREADY)
     {
-        g_sawXferReadyCallback = true;
-        g_xferReadySourceId = origin->Id;
-        g_xferReadyAppId = destination->Id;
+        g_xferReadySourceId.store(origin->Id);
+        g_xferReadyAppId.store(destination->Id);
+        g_sawXferReadyCallback.store(true);
         std::printf(
             "DSM DAT_NULL/MSG_XFERREADY: sourceId=%lu appId=%lu\n",
             static_cast<unsigned long>(origin->Id),
@@ -79,6 +80,47 @@ void TW_CALLINGSTYLE SmokeDsmMemUnlock(TW_HANDLE handle)
     {
         GlobalUnlock(handle);
     }
+}
+
+bool WaitForXferReadyCallback(DWORD timeoutMilliseconds)
+{
+    const ULONGLONG deadline = GetTickCount64() + timeoutMilliseconds;
+    while (!g_sawXferReadyCallback.load())
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+        {
+            return false;
+        }
+
+        const auto remaining = static_cast<DWORD>((std::min)(deadline - now, static_cast<ULONGLONG>(25)));
+        Sleep(remaining);
+    }
+
+    return true;
+}
+
+bool EnvironmentFlagEnabled(const wchar_t* name)
+{
+    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0)
+    {
+        return false;
+    }
+
+    wchar_t value[16] = {};
+    const auto valueLength = static_cast<DWORD>(sizeof(value) / sizeof(value[0]));
+    const DWORD written = GetEnvironmentVariableW(name, value, valueLength);
+    if (written == 0 || written >= valueLength)
+    {
+        return false;
+    }
+
+    return wcscmp(value, L"1") == 0 ||
+        wcscmp(value, L"true") == 0 ||
+        wcscmp(value, L"TRUE") == 0 ||
+        wcscmp(value, L"yes") == 0 ||
+        wcscmp(value, L"YES") == 0;
 }
 
 void CopyTwainString(char* destination, size_t destinationSize, const char* source)
@@ -378,8 +420,7 @@ int wmain(int argc, wchar_t** argv)
     failures += ExpectSuccess(
         "DAT_IDENTITY/MSG_OPENDS",
         entry(&app, DG_CONTROL, DAT_IDENTITY, MSG_OPENDS, &source));
-    const bool useMemoryTransfer =
-        GetEnvironmentVariableW(L"MBF_SMOKE_USE_MEMORY", nullptr, 0) > 0;
+    const bool useMemoryTransfer = EnvironmentFlagEnabled(L"MBF_SMOKE_USE_MEMORY");
 
     TW_CAPABILITY supported{};
     supported.Cap = CAP_SUPPORTEDCAPS;
@@ -406,6 +447,8 @@ int wmain(int argc, wchar_t** argv)
         (supportedDats.ConType != TWON_ARRAY ||
          !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_ENTRYPOINT) ||
          !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_EVENT) ||
+         !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_PENDINGXFERS) ||
+         !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_XFERGROUP) ||
          !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_IMAGE << 16) | DAT_IMAGENATIVEXFER)))
     {
         std::printf("CAP_SUPPORTEDDATS: missing required DATs\n");
@@ -558,13 +601,26 @@ int wmain(int argc, wchar_t** argv)
     }
 
     TW_USERINTERFACE userInterface{};
-    const bool expectXferReady =
-        GetEnvironmentVariableW(L"MBF_SMOKE_EXPECT_XFERREADY", nullptr, 0) > 0;
+    const bool expectXferReady = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_XFERREADY");
+    const bool expectEnableCallback = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_ENABLE_CALLBACK");
     userInterface.ShowUI = expectXferReady ? TRUE : FALSE;
     userInterface.ModalUI = FALSE;
     failures += ExpectSuccess(
         "DAT_USERINTERFACE/MSG_ENABLEDS",
         entry(&app, DG_CONTROL, DAT_USERINTERFACE, MSG_ENABLEDS, &userInterface));
+
+    if (expectEnableCallback)
+    {
+        if (WaitForXferReadyCallback(2500))
+        {
+            std::printf("DSM DAT_NULL/MSG_XFERREADY: observed before first DAT_EVENT\n");
+        }
+        else
+        {
+            std::printf("DSM DAT_NULL/MSG_XFERREADY: timed out before first DAT_EVENT\n");
+            ++failures;
+        }
+    }
 
     TW_EVENT event{};
     const TW_UINT16 eventReturn = entry(&app, DG_CONTROL, DAT_EVENT, MSG_PROCESSEVENT, &event);
@@ -573,17 +629,17 @@ int wmain(int argc, wchar_t** argv)
         if (eventReturn == TWRC_DSEVENT && event.TWMessage == MSG_XFERREADY)
         {
             std::printf("DAT_EVENT/MSG_PROCESSEVENT: MSG_XFERREADY\n");
-            if (!g_sawXferReadyCallback)
+            if (!g_sawXferReadyCallback.load())
             {
                 std::printf("DSM DAT_NULL/MSG_XFERREADY: callback was not observed\n");
                 ++failures;
             }
-            if (g_xferReadySourceId != 17 || g_xferReadyAppId != 41)
+            if (g_xferReadySourceId.load() != 17 || g_xferReadyAppId.load() != 41)
             {
                 std::printf(
                     "DSM DAT_NULL/MSG_XFERREADY: unexpected ids source=%lu app=%lu\n",
-                    static_cast<unsigned long>(g_xferReadySourceId),
-                    static_cast<unsigned long>(g_xferReadyAppId));
+                    static_cast<unsigned long>(g_xferReadySourceId.load()),
+                    static_cast<unsigned long>(g_xferReadyAppId.load()));
                 ++failures;
             }
 
@@ -597,6 +653,30 @@ int wmain(int argc, wchar_t** argv)
                     "DAT_IMAGEINFO/MSG_GET: invalid image size %ld x %ld\n",
                     static_cast<long>(imageInfo.ImageWidth),
                     static_cast<long>(imageInfo.ImageLength));
+                ++failures;
+            }
+
+            TW_UINT32 transferGroup = 0;
+            failures += ExpectSuccess(
+                "DAT_XFERGROUP/MSG_GET",
+                entry(&app, DG_CONTROL, DAT_XFERGROUP, MSG_GET, &transferGroup));
+            if (transferGroup != DG_IMAGE)
+            {
+                std::printf(
+                    "DAT_XFERGROUP/MSG_GET: expected DG_IMAGE, got %lu\n",
+                    static_cast<unsigned long>(transferGroup));
+                ++failures;
+            }
+
+            TW_PENDINGXFERS readyPendingTransfers{};
+            failures += ExpectSuccess(
+                "DAT_PENDINGXFERS/MSG_GET",
+                entry(&app, DG_CONTROL, DAT_PENDINGXFERS, MSG_GET, &readyPendingTransfers));
+            if (readyPendingTransfers.Count != 1)
+            {
+                std::printf(
+                    "DAT_PENDINGXFERS/MSG_GET: expected 1 remaining, got %u\n",
+                    readyPendingTransfers.Count);
                 ++failures;
             }
 

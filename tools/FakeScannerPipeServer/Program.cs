@@ -12,6 +12,7 @@ internal sealed record Options(
     int XResolution,
     int YResolution,
     bool ScanRequested,
+    int? ScanAfterBeginDelayMilliseconds,
     int MaxConnections,
     IReadOnlyList<string> Images);
 
@@ -36,6 +37,19 @@ internal static class Program
     {
         uint revision = initialOptions.Revision;
         bool scanRequested = initialOptions.ScanRequested;
+        long? scanReadyAtTick = null;
+
+        void MaybePromoteDelayedReady()
+        {
+            if (scanReadyAtTick is long readyAtTick &&
+                !scanRequested &&
+                Environment.TickCount64 >= readyAtTick)
+            {
+                scanRequested = true;
+                revision++;
+                scanReadyAtTick = null;
+            }
+        }
 
         for (int connection = 0; connection < initialOptions.MaxConnections; connection++)
         {
@@ -72,12 +86,20 @@ internal static class Program
 
             if (string.Equals(command, "GET_STATE", StringComparison.Ordinal))
             {
+                MaybePromoteDelayedReady();
                 WriteState(writer, initialOptions, revision, scanRequested);
                 continue;
             }
 
             if (string.Equals(command, "BEGIN_SCAN", StringComparison.Ordinal))
             {
+                if (initialOptions.ScanAfterBeginDelayMilliseconds is int delayMilliseconds)
+                {
+                    scanRequested = false;
+                    revision++;
+                    scanReadyAtTick = Environment.TickCount64 + delayMilliseconds;
+                }
+
                 writer.Write("OK BEGIN_SCAN\n");
                 continue;
             }
@@ -131,6 +153,7 @@ internal static class Program
         int xResolution = 300;
         int yResolution = 300;
         bool scanRequested = true;
+        int? scanAfterBeginDelayMilliseconds = null;
         int maxConnections = 3;
         List<string> images = [];
 
@@ -206,6 +229,17 @@ internal static class Program
                     index++;
                     break;
 
+                case "--scan-after-begin-delay-ms":
+                    if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int delayMilliseconds) ||
+                        delayMilliseconds < 0)
+                    {
+                        return Fail("Invalid --scan-after-begin-delay-ms value", out options, out error);
+                    }
+
+                    scanAfterBeginDelayMilliseconds = delayMilliseconds;
+                    index++;
+                    break;
+
                 case "--connections":
                     if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out maxConnections) ||
                         maxConnections <= 0)
@@ -255,6 +289,7 @@ internal static class Program
             xResolution,
             yResolution,
             scanRequested,
+            scanAfterBeginDelayMilliseconds,
             maxConnections,
             images);
         error = null;
@@ -291,6 +326,6 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.Error.WriteLine(
-            "Usage: FakeScannerPipeServer --image <path> [--connections 3] [--pixel RGB|GRAY|BW] [--revision n]");
+            "Usage: FakeScannerPipeServer --image <path> [--connections 3] [--pixel RGB|GRAY|BW] [--revision n] [--scan-after-begin-delay-ms n]");
     }
 }
