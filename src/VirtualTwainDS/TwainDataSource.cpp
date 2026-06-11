@@ -16,9 +16,10 @@
 namespace
 {
 
-constexpr std::array<TW_UINT16, 13> kSupportedCapabilities = {
+constexpr std::array<TW_UINT16, 14> kSupportedCapabilities = {
     CAP_XFERCOUNT,
     CAP_SUPPORTEDCAPS,
+    CAP_SUPPORTEDDATS,
     CAP_FEEDERENABLED,
     CAP_UICONTROLLABLE,
     CAP_DUPLEX,
@@ -30,6 +31,22 @@ constexpr std::array<TW_UINT16, 13> kSupportedCapabilities = {
     ICAP_AUTOMATICBORDERDETECTION,
     ICAP_AUTOMATICDESKEW,
     ICAP_XFERMECH,
+};
+
+constexpr std::array<TW_UINT32, 13> kSupportedDataArgumentTypes = {
+    (DG_CONTROL << 16) | DAT_CAPABILITY,
+    (DG_CONTROL << 16) | DAT_ENTRYPOINT,
+    (DG_CONTROL << 16) | DAT_EVENT,
+    (DG_CONTROL << 16) | DAT_IDENTITY,
+    (DG_CONTROL << 16) | DAT_PENDINGXFERS,
+    (DG_CONTROL << 16) | DAT_SETUPMEMXFER,
+    (DG_CONTROL << 16) | DAT_STATUS,
+    (DG_CONTROL << 16) | DAT_USERINTERFACE,
+    (DG_IMAGE << 16) | DAT_IMAGEINFO,
+    (DG_IMAGE << 16) | DAT_IMAGEMEMXFER,
+    (DG_IMAGE << 16) | DAT_IMAGENATIVEXFER,
+    (DG_CONTROL << 16) | DAT_CALLBACK,
+    (DG_CONTROL << 16) | DAT_CALLBACK2,
 };
 
 constexpr std::array<TW_BOOL, 2> kDuplexValues = {FALSE, TRUE};
@@ -84,6 +101,8 @@ size_t ItemSize(TW_UINT16 itemType) noexcept
         return sizeof(TW_UINT16);
     case TWTY_INT32:
         return sizeof(TW_INT32);
+    case TWTY_UINT32:
+        return sizeof(TW_UINT32);
     case TWTY_FIX32:
         return sizeof(TW_FIX32);
     default:
@@ -121,6 +140,35 @@ TW_HANDLE BuildOneValue(TW_UINT16 itemType, TW_UINT32 packedItem) noexcept
 
     oneValue->ItemType = itemType;
     oneValue->Item = packedItem;
+    GlobalUnlock(handle);
+    return handle;
+}
+
+TW_HANDLE BuildArray(TW_UINT16 itemType, const void* values, TW_UINT32 itemCount) noexcept
+{
+    const size_t itemSize = ItemSize(itemType);
+    if (values == nullptr || itemSize == 0 || itemCount == 0)
+    {
+        return nullptr;
+    }
+
+    const size_t bytes = offsetof(TW_ARRAY, ItemList) + (itemSize * itemCount);
+    TW_HANDLE handle = AllocateContainer(bytes);
+    if (handle == nullptr)
+    {
+        return nullptr;
+    }
+
+    auto* array = static_cast<pTW_ARRAY>(GlobalLock(handle));
+    if (array == nullptr)
+    {
+        FreeContainer(handle);
+        return nullptr;
+    }
+
+    array->ItemType = itemType;
+    array->NumItems = itemCount;
+    std::memcpy(array->ItemList, values, itemSize * itemCount);
     GlobalUnlock(handle);
     return handle;
 }
@@ -574,6 +622,8 @@ std::wstring DataArgumentTypeName(TW_UINT16 dataArgumentType)
         return L"DAT_SETUPMEMXFER";
     case DAT_STATUS:
         return L"DAT_STATUS";
+    case DAT_ENTRYPOINT:
+        return L"DAT_ENTRYPOINT";
     case DAT_IMAGEINFO:
         return L"DAT_IMAGEINFO";
     case DAT_IMAGENATIVEXFER:
@@ -727,6 +777,9 @@ TW_UINT16 VirtualTwainDataSource::Entry(
         case DAT_STATUS:
             result = HandleStatus(message, data);
             break;
+        case DAT_ENTRYPOINT:
+            result = HandleEntryPoint(message, data);
+            break;
         default:
             result = Fail(TWCC_BADPROTOCOL);
             break;
@@ -779,6 +832,7 @@ TW_UINT16 VirtualTwainDataSource::HandleIdentity(
             openOrigin_.reset();
         }
 
+        identity_.Id = requestedIdentity->Id;
         *requestedIdentity = identity_;
         state_ = TwainState::SourceOpened;
         return Succeed();
@@ -792,6 +846,7 @@ TW_UINT16 VirtualTwainDataSource::HandleIdentity(
         state_ = TwainState::SourceLoaded;
         openOrigin_.reset();
         transferReady_ = false;
+        transferReadyNotified_ = false;
         pendingImages_.clear();
         pendingIpcRevision_ = 0;
         pendingTransferIndex_ = 0;
@@ -869,6 +924,7 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
                 std::to_wstring(EnvironmentFlagEnabled(L"MBF_TWAIN_FORCE_UI") ? 1U : 0U));
 
         transferReady_ = false;
+        transferReadyNotified_ = false;
         pendingImages_.clear();
         pendingIpcRevision_ = 0;
         pendingTransferIndex_ = 0;
@@ -884,16 +940,28 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
             return Fail(TWCC_OPERATIONERROR);
         }
 
+        if (!shouldShowUi && RefreshTransferReadyFromIpc())
+        {
+            transferReady_ = true;
+            state_ = TwainState::TransferReady;
+            NotifyTransferReady();
+        }
+
         return Succeed();
     }
 
     case MSG_DISABLEDS:
+        if (state_ == TwainState::SourceOpened)
+        {
+            return Succeed();
+        }
         if (!IsAtLeast(TwainState::SourceEnabled))
         {
             return Fail(TWCC_SEQERROR);
         }
 
         transferReady_ = false;
+        transferReadyNotified_ = false;
         pendingImages_.clear();
         pendingIpcRevision_ = 0;
         pendingTransferIndex_ = 0;
@@ -934,6 +1002,7 @@ TW_UINT16 VirtualTwainDataSource::HandleEvent(TW_UINT16 message, TW_MEMREF data)
     {
         state_ = TwainState::TransferReady;
         event->TWMessage = MSG_XFERREADY;
+        NotifyTransferReady();
         lastStatus_.ConditionCode = TWCC_SUCCESS;
         lastStatus_.Data = 0;
         return TWRC_DSEVENT;
@@ -971,11 +1040,13 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
         if (remaining > 0)
         {
             transferReady_ = true;
+            transferReadyNotified_ = false;
             state_ = TwainState::TransferReady;
         }
         else
         {
             transferReady_ = false;
+            transferReadyNotified_ = false;
             ResetMemoryTransfer();
             state_ = TwainState::SourceEnabled;
             AcknowledgeScanIfComplete();
@@ -985,15 +1056,20 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
     }
 
     case MSG_RESET:
+    {
+        const TwainState resetState =
+            state_ == TwainState::SourceOpened ? TwainState::SourceOpened : TwainState::SourceEnabled;
         pendingTransfers->Count = 0;
         pendingTransfers->EOJ = 0;
         transferReady_ = false;
+        transferReadyNotified_ = false;
         pendingTransferIndex_ = 0;
         pendingImages_.clear();
         ResetMemoryTransfer();
-        state_ = TwainState::SourceEnabled;
+        state_ = resetState;
         AcknowledgeScanIfComplete();
         return Succeed();
+    }
 
     default:
         return Fail(TWCC_BADPROTOCOL);
@@ -1198,6 +1274,23 @@ TW_UINT16 VirtualTwainDataSource::HandleStatus(TW_UINT16 message, TW_MEMREF data
     return TWRC_SUCCESS;
 }
 
+TW_UINT16 VirtualTwainDataSource::HandleEntryPoint(TW_UINT16 message, TW_MEMREF data)
+{
+    if (message != MSG_SET)
+    {
+        return Fail(TWCC_BADPROTOCOL);
+    }
+
+    auto* entryPoint = static_cast<pTW_ENTRYPOINT>(data);
+    if (entryPoint == nullptr)
+    {
+        return Fail(TWCC_BADVALUE);
+    }
+
+    entryPoint_ = *entryPoint;
+    return Succeed();
+}
+
 TW_UINT16 VirtualTwainDataSource::GetCapability(TW_UINT16 message, pTW_CAPABILITY capability)
 {
     TW_HANDLE container = nullptr;
@@ -1217,6 +1310,14 @@ TW_UINT16 VirtualTwainDataSource::GetCapability(TW_UINT16 message, pTW_CAPABILIT
             static_cast<TW_UINT32>(kSupportedCapabilities.size()),
             0,
             0);
+        break;
+
+    case CAP_SUPPORTEDDATS:
+        containerType = TWON_ARRAY;
+        container = BuildArray(
+            TWTY_UINT32,
+            kSupportedDataArgumentTypes.data(),
+            static_cast<TW_UINT32>(kSupportedDataArgumentTypes.size()));
         break;
 
     case CAP_FEEDERENABLED:
@@ -1488,6 +1589,7 @@ TW_UINT16 VirtualTwainDataSource::SetCapability(pTW_CAPABILITY capability)
     }
 
     case CAP_SUPPORTEDCAPS:
+    case CAP_SUPPORTEDDATS:
         return Fail(TWCC_CAPBADOPERATION);
 
     default:
@@ -1513,6 +1615,7 @@ TW_UINT16 VirtualTwainDataSource::QueryCapabilitySupport(pTW_CAPABILITY capabili
     switch (capability->Cap)
     {
     case CAP_SUPPORTEDCAPS:
+    case CAP_SUPPORTEDDATS:
         support = kReadOnlyCapabilitySupport;
         break;
     case CAP_XFERCOUNT:
@@ -1586,6 +1689,7 @@ TW_UINT16 VirtualTwainDataSource::ResetCapabilityValue(TW_UINT16 capability) noe
         settings_.transferMechanism = TWSX_NATIVE;
         return Succeed();
     case CAP_SUPPORTEDCAPS:
+    case CAP_SUPPORTEDDATS:
         return Fail(TWCC_CAPBADOPERATION);
     default:
         return Fail(TWCC_CAPUNSUPPORTED);
@@ -1639,6 +1743,7 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
 
     pendingIpcRevision_ = ipcState.revision;
     pendingTransferIndex_ = 0;
+    transferReadyNotified_ = false;
     ResetMemoryTransfer();
     pendingImages_ = std::move(ipcState.selectedImages);
     diagnostics::AppendLine(
@@ -1646,6 +1751,45 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
         L"Transfer ready from IPC revision=" + std::to_wstring(pendingIpcRevision_) +
             L" imageCount=" + std::to_wstring(pendingImages_.size()));
     return true;
+}
+
+bool VirtualTwainDataSource::NotifyTransferReady()
+{
+    if (transferReadyNotified_)
+    {
+        diagnostics::AppendLine(L"DS", L"NotifyTransferReady skipped because already notified");
+        return true;
+    }
+
+    if (entryPoint_.DSM_Entry == nullptr)
+    {
+        diagnostics::AppendLine(L"DS", L"NotifyTransferReady skipped because DSM_Entry is null");
+        return false;
+    }
+
+    if (!openOrigin_)
+    {
+        diagnostics::AppendLine(L"DS", L"NotifyTransferReady skipped because app identity is missing");
+        return false;
+    }
+
+    transferReadyNotified_ = true;
+    TW_IDENTITY sourceIdentity = identity_;
+    TW_IDENTITY appIdentity = *openOrigin_;
+    const TW_UINT16 rc = entryPoint_.DSM_Entry(
+        &sourceIdentity,
+        &appIdentity,
+        DG_CONTROL,
+        DAT_NULL,
+        MSG_XFERREADY,
+        nullptr);
+
+    diagnostics::AppendLine(
+        L"DS",
+        L"NotifyTransferReady DAT_NULL/MSG_XFERREADY rc=" + std::to_wstring(rc) +
+            L" sourceId=" + std::to_wstring(sourceIdentity.Id) +
+            L" appId=" + std::to_wstring(appIdentity.Id));
+    return rc == TWRC_SUCCESS;
 }
 
 bool VirtualTwainDataSource::BeginUiScanSession(bool shouldShowUi)
@@ -1870,7 +2014,7 @@ TW_IDENTITY VirtualTwainDataSource::BuildSourceIdentity() noexcept
 
     identity.ProtocolMajor = TWON_PROTOCOLMAJOR;
     identity.ProtocolMinor = TWON_PROTOCOLMINOR;
-    identity.SupportedGroups = DG_CONTROL | DG_IMAGE;
+    identity.SupportedGroups = DG_CONTROL | DG_IMAGE | DF_DS2;
 
     CopyTwainString(identity.Manufacturer, sizeof(identity.Manufacturer), "MBF");
     CopyTwainString(identity.ProductFamily, sizeof(identity.ProductFamily), "Virtual Scanner");

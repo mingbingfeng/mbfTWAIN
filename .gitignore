@@ -12,3 +12,5 @@ obj/
 *.VC.opendb
 *.ipch
 .vs/
+.codex_delegate/
+.omc/

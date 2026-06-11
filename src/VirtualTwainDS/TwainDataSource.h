@@ -69,6 +69,7 @@ private:
     TW_UINT16 HandleEvent(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandlePendingTransfers(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleSetupMemoryTransfer(TW_UINT16 message, TW_MEMREF data);
+    TW_UINT16 HandleEntryPoint(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleImage(TW_UINT16 dataArgumentType, TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleImageInfo(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleImageNativeTransfer(TW_UINT16 message, TW_MEMREF data);
@@ -82,6 +83,7 @@ private:
     TW_UINT16 ResetAllCapabilities() noexcept;
     TW_UINT16 ResetCapabilityValue(TW_UINT16 capability) noexcept;
     bool RefreshTransferReadyFromIpc();
+    bool NotifyTransferReady();
     bool BeginUiScanSession(bool shouldShowUi);
     bool LaunchScannerUiProcess() const;
     bool FillCurrentImageInfo(pTW_IMAGEINFO imageInfo);
@@ -102,10 +104,12 @@ private:
     TW_STATUS lastStatus_{};
     ScannerSettings settings_{};
     bool transferReady_ = false;
+    bool transferReadyNotified_ = false;
     std::uint32_t pendingIpcRevision_ = 0;
     TW_UINT32 pendingTransferIndex_ = 0;
     std::vector<std::wstring> pendingImages_;
     MemoryTransferState memoryTransfer_{};
+    TW_ENTRYPOINT entryPoint_{};
     std::optional<TW_IDENTITY> openOrigin_;
 };
 

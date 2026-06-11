@@ -24,6 +24,63 @@ using DsEntry = TW_UINT16(TW_CALLINGSTYLE*)(
     TW_UINT16 message,
     TW_MEMREF data);
 
+bool g_sawXferReadyCallback = false;
+TW_UINT32 g_xferReadySourceId = 0;
+TW_UINT32 g_xferReadyAppId = 0;
+
+TW_UINT16 TW_CALLINGSTYLE SmokeDsmEntry(
+    pTW_IDENTITY origin,
+    pTW_IDENTITY destination,
+    TW_UINT32 dataGroup,
+    TW_UINT16 dataArgumentType,
+    TW_UINT16 message,
+    TW_MEMREF)
+{
+    if (origin != nullptr &&
+        destination != nullptr &&
+        dataGroup == DG_CONTROL &&
+        dataArgumentType == DAT_NULL &&
+        message == MSG_XFERREADY)
+    {
+        g_sawXferReadyCallback = true;
+        g_xferReadySourceId = origin->Id;
+        g_xferReadyAppId = destination->Id;
+        std::printf(
+            "DSM DAT_NULL/MSG_XFERREADY: sourceId=%lu appId=%lu\n",
+            static_cast<unsigned long>(origin->Id),
+            static_cast<unsigned long>(destination->Id));
+        return TWRC_SUCCESS;
+    }
+
+    return TWRC_FAILURE;
+}
+
+TW_HANDLE TW_CALLINGSTYLE SmokeDsmMemAllocate(TW_UINT32 size)
+{
+    return GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size);
+}
+
+void TW_CALLINGSTYLE SmokeDsmMemFree(TW_HANDLE handle)
+{
+    if (handle != nullptr)
+    {
+        GlobalFree(handle);
+    }
+}
+
+TW_MEMREF TW_CALLINGSTYLE SmokeDsmMemLock(TW_HANDLE handle)
+{
+    return handle == nullptr ? nullptr : GlobalLock(handle);
+}
+
+void TW_CALLINGSTYLE SmokeDsmMemUnlock(TW_HANDLE handle)
+{
+    if (handle != nullptr)
+    {
+        GlobalUnlock(handle);
+    }
+}
+
 void CopyTwainString(char* destination, size_t destinationSize, const char* source)
 {
     std::memset(destination, 0, destinationSize);
@@ -57,6 +114,8 @@ size_t ItemSize(TW_UINT16 itemType)
         return sizeof(TW_UINT16);
     case TWTY_INT32:
         return sizeof(TW_INT32);
+    case TWTY_UINT32:
+        return sizeof(TW_UINT32);
     case TWTY_FIX32:
         return sizeof(TW_FIX32);
     default:
@@ -140,12 +199,41 @@ bool EnumerationContains(TW_HANDLE handle, TW_UINT16 expectedItemType, TW_UINT32
     return found;
 }
 
+bool ArrayContains(TW_HANDLE handle, TW_UINT16 expectedItemType, TW_UINT32 packedNeedle)
+{
+    auto* array = static_cast<pTW_ARRAY>(GlobalLock(handle));
+    if (array == nullptr)
+    {
+        return false;
+    }
+
+    const size_t itemSize = ItemSize(expectedItemType);
+    bool found = false;
+    if (array->ItemType == expectedItemType && itemSize > 0)
+    {
+        for (TW_UINT32 index = 0; index < array->NumItems; ++index)
+        {
+            TW_UINT32 current = 0;
+            std::memcpy(&current, array->ItemList + (index * itemSize), itemSize);
+            if (current == packedNeedle)
+            {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    GlobalUnlock(handle);
+    return found;
+}
+
 TW_IDENTITY BuildAppIdentity()
 {
     TW_IDENTITY identity{};
+    identity.Id = 41;
     identity.ProtocolMajor = TWON_PROTOCOLMAJOR;
     identity.ProtocolMinor = TWON_PROTOCOLMINOR;
-    identity.SupportedGroups = DG_CONTROL | DG_IMAGE;
+    identity.SupportedGroups = DG_CONTROL | DG_IMAGE | DF_APP2;
     identity.Version.MajorNum = 1;
     identity.Version.MinorNum = 0;
     identity.Version.Language = TWLG_ENGLISH_USA;
@@ -155,6 +243,18 @@ TW_IDENTITY BuildAppIdentity()
     CopyTwainString(identity.ProductFamily, sizeof(identity.ProductFamily), "Test Host");
     CopyTwainString(identity.ProductName, sizeof(identity.ProductName), "SmokeDsEntry");
     return identity;
+}
+
+TW_ENTRYPOINT BuildEntryPoint()
+{
+    TW_ENTRYPOINT entryPoint{};
+    entryPoint.Size = sizeof(entryPoint);
+    entryPoint.DSM_Entry = SmokeDsmEntry;
+    entryPoint.DSM_MemAllocate = SmokeDsmMemAllocate;
+    entryPoint.DSM_MemFree = SmokeDsmMemFree;
+    entryPoint.DSM_MemLock = SmokeDsmMemLock;
+    entryPoint.DSM_MemUnlock = SmokeDsmMemUnlock;
+    return entryPoint;
 }
 
 int ExpectSuccess(const char* label, TW_UINT16 returnCode)
@@ -268,6 +368,12 @@ int wmain(int argc, wchar_t** argv)
         "DAT_IDENTITY/MSG_GET",
         entry(&app, DG_CONTROL, DAT_IDENTITY, MSG_GET, &source));
     std::printf("ProductName: %s\n", source.ProductName);
+    source.Id = 17;
+
+    TW_ENTRYPOINT entryPoint = BuildEntryPoint();
+    failures += ExpectSuccess(
+        "DAT_ENTRYPOINT/MSG_SET",
+        entry(&app, DG_CONTROL, DAT_ENTRYPOINT, MSG_SET, &entryPoint));
 
     failures += ExpectSuccess(
         "DAT_IDENTITY/MSG_OPENDS",
@@ -290,6 +396,22 @@ int wmain(int argc, wchar_t** argv)
         ++failures;
     }
     FreeContainer(supported);
+
+    TW_CAPABILITY supportedDats{};
+    supportedDats.Cap = CAP_SUPPORTEDDATS;
+    failures += ExpectSuccess(
+        "CAP_SUPPORTEDDATS/MSG_GET",
+        entry(&app, DG_CONTROL, DAT_CAPABILITY, MSG_GET, &supportedDats));
+    if (failures == 0 &&
+        (supportedDats.ConType != TWON_ARRAY ||
+         !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_ENTRYPOINT) ||
+         !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_EVENT) ||
+         !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_IMAGE << 16) | DAT_IMAGENATIVEXFER)))
+    {
+        std::printf("CAP_SUPPORTEDDATS: missing required DATs\n");
+        ++failures;
+    }
+    FreeContainer(supportedDats);
 
     failures += ExpectOneValue(
         "CAP_XFERCOUNT/default current",
@@ -451,6 +573,19 @@ int wmain(int argc, wchar_t** argv)
         if (eventReturn == TWRC_DSEVENT && event.TWMessage == MSG_XFERREADY)
         {
             std::printf("DAT_EVENT/MSG_PROCESSEVENT: MSG_XFERREADY\n");
+            if (!g_sawXferReadyCallback)
+            {
+                std::printf("DSM DAT_NULL/MSG_XFERREADY: callback was not observed\n");
+                ++failures;
+            }
+            if (g_xferReadySourceId != 17 || g_xferReadyAppId != 41)
+            {
+                std::printf(
+                    "DSM DAT_NULL/MSG_XFERREADY: unexpected ids source=%lu app=%lu\n",
+                    static_cast<unsigned long>(g_xferReadySourceId),
+                    static_cast<unsigned long>(g_xferReadyAppId));
+                ++failures;
+            }
 
             TW_IMAGEINFO imageInfo{};
             failures += ExpectSuccess(
