@@ -1916,10 +1916,25 @@ void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcSta
     transferReadyNotified_ = false;
     ResetMemoryTransfer();
     pendingImages_ = std::move(ipcState.selectedImages);
+    if (settings_.transferCount > 0)
+    {
+        const size_t requestedImageCount = static_cast<size_t>(settings_.transferCount);
+        if (pendingImages_.size() > requestedImageCount)
+        {
+            diagnostics::AppendLine(
+                L"DS",
+                L"CAP_XFERCOUNT truncating scan revision=" + std::to_wstring(pendingIpcRevision_) +
+                    L" requested=" + std::to_wstring(settings_.transferCount) +
+                    L" available=" + std::to_wstring(pendingImages_.size()) +
+                    L" dropping=" + std::to_wstring(pendingImages_.size() - requestedImageCount));
+            pendingImages_.resize(requestedImageCount);
+        }
+    }
     diagnostics::AppendLine(
         L"DS",
         L"Transfer ready from IPC revision=" + std::to_wstring(pendingIpcRevision_) +
-            L" imageCount=" + std::to_wstring(pendingImages_.size()));
+            L" imageCount=" + std::to_wstring(pendingImages_.size()) +
+            L" xferCount=" + std::to_wstring(settings_.transferCount));
 }
 
 bool VirtualTwainDataSource::NotifyTransferReady()

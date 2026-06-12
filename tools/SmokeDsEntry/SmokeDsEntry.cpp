@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <cwchar>
 #include <cstring>
 
 #include "twain.h"
@@ -121,6 +122,27 @@ bool EnvironmentFlagEnabled(const wchar_t* name)
         wcscmp(value, L"TRUE") == 0 ||
         wcscmp(value, L"yes") == 0 ||
         wcscmp(value, L"YES") == 0;
+}
+
+bool TryReadEnvironmentLong(const wchar_t* name, long& value)
+{
+    wchar_t buffer[32] = {};
+    const auto bufferLength = static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0]));
+    const DWORD written = GetEnvironmentVariableW(name, buffer, bufferLength);
+    if (written == 0 || written >= bufferLength)
+    {
+        return false;
+    }
+
+    wchar_t* end = nullptr;
+    const long parsed = std::wcstol(buffer, &end, 10);
+    if (end == buffer || end == nullptr || *end != L'\0')
+    {
+        return false;
+    }
+
+    value = parsed;
+    return true;
 }
 
 void CopyTwainString(char* destination, size_t destinationSize, const char* source)
@@ -642,6 +664,54 @@ int wmain(int argc, wchar_t** argv)
         ++failures;
     }
 
+    long configuredXferCount = 0;
+    if (TryReadEnvironmentLong(L"MBF_SMOKE_SET_XFERCOUNT", configuredXferCount))
+    {
+        if (configuredXferCount == 0 || configuredXferCount < -1 || configuredXferCount > 0x7fff)
+        {
+            std::printf(
+                "MBF_SMOKE_SET_XFERCOUNT: invalid value %ld\n",
+                configuredXferCount);
+            ++failures;
+        }
+        else
+        {
+            const TW_UINT32 packedXferCount =
+                static_cast<TW_UINT16>(static_cast<TW_INT16>(configuredXferCount));
+            failures += SetOneValue(
+                "CAP_XFERCOUNT/SET configured",
+                entry,
+                app,
+                CAP_XFERCOUNT,
+                TWTY_INT16,
+                packedXferCount);
+            failures += ExpectOneValue(
+                "CAP_XFERCOUNT/current configured",
+                entry,
+                app,
+                CAP_XFERCOUNT,
+                TWTY_INT16,
+                packedXferCount);
+        }
+    }
+
+    TW_UINT16 expectedTransferTotal = 1;
+    long expectedTransferTotalValue = 0;
+    if (TryReadEnvironmentLong(L"MBF_SMOKE_EXPECT_TRANSFER_TOTAL", expectedTransferTotalValue))
+    {
+        if (expectedTransferTotalValue <= 0 || expectedTransferTotalValue > 0xffff)
+        {
+            std::printf(
+                "MBF_SMOKE_EXPECT_TRANSFER_TOTAL: invalid value %ld\n",
+                expectedTransferTotalValue);
+            ++failures;
+        }
+        else
+        {
+            expectedTransferTotal = static_cast<TW_UINT16>(expectedTransferTotalValue);
+        }
+    }
+
     TW_USERINTERFACE userInterface{};
     const bool expectXferReady = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_XFERREADY");
     const bool expectEnableCallback = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_ENABLE_CALLBACK");
@@ -697,19 +767,6 @@ int wmain(int argc, wchar_t** argv)
                     TWSS_A3);
             }
 
-            TW_IMAGEINFO imageInfo{};
-            failures += ExpectSuccess(
-                "DAT_IMAGEINFO/MSG_GET",
-                entry(&app, DG_IMAGE, DAT_IMAGEINFO, MSG_GET, &imageInfo));
-            if (imageInfo.ImageWidth <= 0 || imageInfo.ImageLength <= 0)
-            {
-                std::printf(
-                    "DAT_IMAGEINFO/MSG_GET: invalid image size %ld x %ld\n",
-                    static_cast<long>(imageInfo.ImageWidth),
-                    static_cast<long>(imageInfo.ImageLength));
-                ++failures;
-            }
-
             TW_UINT32 transferGroup = 0;
             failures += ExpectSuccess(
                 "DAT_XFERGROUP/MSG_GET",
@@ -726,154 +783,224 @@ int wmain(int argc, wchar_t** argv)
             failures += ExpectSuccess(
                 "DAT_PENDINGXFERS/MSG_GET",
                 entry(&app, DG_CONTROL, DAT_PENDINGXFERS, MSG_GET, &readyPendingTransfers));
-            if (readyPendingTransfers.Count != 1)
+            if (readyPendingTransfers.Count != expectedTransferTotal)
             {
                 std::printf(
-                    "DAT_PENDINGXFERS/MSG_GET: expected 1 remaining, got %u\n",
+                    "DAT_PENDINGXFERS/MSG_GET: expected %u remaining, got %u\n",
+                    expectedTransferTotal,
                     readyPendingTransfers.Count);
                 ++failures;
             }
 
             if (useMemoryTransfer)
             {
-                TW_SETUPMEMXFER setup{};
-                failures += ExpectSuccess(
-                    "DAT_SETUPMEMXFER/MSG_GET",
-                    entry(&app, DG_CONTROL, DAT_SETUPMEMXFER, MSG_GET, &setup));
-                if (setup.MinBufSize == 0 || setup.Preferred < setup.MinBufSize || setup.MaxBufSize < setup.Preferred)
-                {
-                    std::printf("DAT_SETUPMEMXFER/MSG_GET: invalid buffer sizes\n");
-                    ++failures;
-                }
-
-                BYTE buffer[6] = {};
-                TW_IMAGEMEMXFER memoryTransfer{};
-                memoryTransfer.Memory.Flags = TWMF_APPOWNS | TWMF_POINTER;
-                memoryTransfer.Memory.Length = sizeof(buffer);
-                memoryTransfer.Memory.TheMem = buffer;
-
-                TW_UINT16 transferReturn =
-                    entry(&app, DG_IMAGE, DAT_IMAGEMEMXFER, MSG_GET, &memoryTransfer);
-                if (transferReturn != TWRC_SUCCESS ||
-                    memoryTransfer.BytesWritten != sizeof(buffer) ||
-                    memoryTransfer.Rows != 1 ||
-                    memoryTransfer.YOffset != 0)
+                if (expectedTransferTotal != 1)
                 {
                     std::printf(
-                        "DAT_IMAGEMEMXFER first strip: unexpected rc=%u bytes=%lu rows=%lu y=%lu\n",
-                        transferReturn,
-                        static_cast<unsigned long>(memoryTransfer.BytesWritten),
-                        static_cast<unsigned long>(memoryTransfer.Rows),
-                        static_cast<unsigned long>(memoryTransfer.YOffset));
+                        "DAT_IMAGEMEMXFER smoke: expectedTransferTotal=%u is unsupported in this test path\n",
+                        expectedTransferTotal);
                     ++failures;
                 }
                 else
                 {
-                    std::printf("DAT_IMAGEMEMXFER/MSG_GET: first strip OK\n");
-                }
-
-                std::memset(buffer, 0, sizeof(buffer));
-                memoryTransfer = {};
-                memoryTransfer.Memory.Flags = TWMF_APPOWNS | TWMF_POINTER;
-                memoryTransfer.Memory.Length = sizeof(buffer);
-                memoryTransfer.Memory.TheMem = buffer;
-
-                transferReturn = entry(&app, DG_IMAGE, DAT_IMAGEMEMXFER, MSG_GET, &memoryTransfer);
-                if (transferReturn != TWRC_XFERDONE ||
-                    memoryTransfer.BytesWritten != sizeof(buffer) ||
-                    memoryTransfer.Rows != 1 ||
-                    memoryTransfer.YOffset != 1)
-                {
-                    std::printf(
-                        "DAT_IMAGEMEMXFER final strip: unexpected rc=%u bytes=%lu rows=%lu y=%lu\n",
-                        transferReturn,
-                        static_cast<unsigned long>(memoryTransfer.BytesWritten),
-                        static_cast<unsigned long>(memoryTransfer.Rows),
-                        static_cast<unsigned long>(memoryTransfer.YOffset));
-                    ++failures;
-                }
-                else
-                {
-                    std::printf("DAT_IMAGEMEMXFER/MSG_GET: final strip XFERDONE\n");
-                }
-            }
-            else
-            {
-                TW_HANDLE dib = nullptr;
-                const TW_UINT16 transferReturn =
-                    entry(&app, DG_IMAGE, DAT_IMAGENATIVEXFER, MSG_GET, &dib);
-                LONG transferredWidth = 0;
-                LONG transferredHeight = 0;
-                TW_UINT16 transferredBitsPerPixel = 0;
-                if (transferReturn == TWRC_XFERDONE && dib != nullptr)
-                {
-                    auto* header = static_cast<BITMAPINFOHEADER*>(GlobalLock(dib));
-                    if (header == nullptr ||
-                        header->biSize != sizeof(BITMAPINFOHEADER) ||
-                        header->biWidth <= 0 ||
-                        header->biHeight <= 0 ||
-                        header->biSizeImage == 0)
+                    TW_SETUPMEMXFER setup{};
+                    failures += ExpectSuccess(
+                        "DAT_SETUPMEMXFER/MSG_GET",
+                        entry(&app, DG_CONTROL, DAT_SETUPMEMXFER, MSG_GET, &setup));
+                    if (setup.MinBufSize == 0 || setup.Preferred < setup.MinBufSize || setup.MaxBufSize < setup.Preferred)
                     {
-                        std::printf("DAT_IMAGENATIVEXFER/MSG_GET: invalid DIB\n");
+                        std::printf("DAT_SETUPMEMXFER/MSG_GET: invalid buffer sizes\n");
+                        ++failures;
+                    }
+
+                    BYTE buffer[6] = {};
+                    TW_IMAGEMEMXFER memoryTransfer{};
+                    memoryTransfer.Memory.Flags = TWMF_APPOWNS | TWMF_POINTER;
+                    memoryTransfer.Memory.Length = sizeof(buffer);
+                    memoryTransfer.Memory.TheMem = buffer;
+
+                    TW_UINT16 transferReturn =
+                        entry(&app, DG_IMAGE, DAT_IMAGEMEMXFER, MSG_GET, &memoryTransfer);
+                    if (transferReturn != TWRC_SUCCESS ||
+                        memoryTransfer.BytesWritten != sizeof(buffer) ||
+                        memoryTransfer.Rows != 1 ||
+                        memoryTransfer.YOffset != 0)
+                    {
+                        std::printf(
+                            "DAT_IMAGEMEMXFER first strip: unexpected rc=%u bytes=%lu rows=%lu y=%lu\n",
+                            transferReturn,
+                            static_cast<unsigned long>(memoryTransfer.BytesWritten),
+                            static_cast<unsigned long>(memoryTransfer.Rows),
+                            static_cast<unsigned long>(memoryTransfer.YOffset));
                         ++failures;
                     }
                     else
                     {
-                        transferredWidth = header->biWidth;
-                        transferredHeight = header->biHeight;
-                        transferredBitsPerPixel = header->biBitCount;
-                        std::printf(
-                            "DAT_IMAGENATIVEXFER/MSG_GET: XFERDONE %ld x %ld %u bpp\n",
-                            static_cast<long>(header->biWidth),
-                            static_cast<long>(header->biHeight),
-                            header->biBitCount);
+                        std::printf("DAT_IMAGEMEMXFER/MSG_GET: first strip OK\n");
                     }
 
-                    if (header != nullptr)
+                    std::memset(buffer, 0, sizeof(buffer));
+                    memoryTransfer = {};
+                    memoryTransfer.Memory.Flags = TWMF_APPOWNS | TWMF_POINTER;
+                    memoryTransfer.Memory.Length = sizeof(buffer);
+                    memoryTransfer.Memory.TheMem = buffer;
+
+                    transferReturn = entry(&app, DG_IMAGE, DAT_IMAGEMEMXFER, MSG_GET, &memoryTransfer);
+                    if (transferReturn != TWRC_XFERDONE ||
+                        memoryTransfer.BytesWritten != sizeof(buffer) ||
+                        memoryTransfer.Rows != 1 ||
+                        memoryTransfer.YOffset != 1)
                     {
-                        GlobalUnlock(dib);
+                        std::printf(
+                            "DAT_IMAGEMEMXFER final strip: unexpected rc=%u bytes=%lu rows=%lu y=%lu\n",
+                            transferReturn,
+                            static_cast<unsigned long>(memoryTransfer.BytesWritten),
+                            static_cast<unsigned long>(memoryTransfer.Rows),
+                            static_cast<unsigned long>(memoryTransfer.YOffset));
+                        ++failures;
                     }
-                    GlobalFree(dib);
+                    else
+                    {
+                        std::printf("DAT_IMAGEMEMXFER/MSG_GET: final strip XFERDONE\n");
+                    }
 
-                    TW_IMAGEINFO postTransferInfo{};
+                    TW_PENDINGXFERS pendingTransfers{};
                     failures += ExpectSuccess(
-                        "DAT_IMAGEINFO/MSG_GET after native xfer",
-                        entry(&app, DG_IMAGE, DAT_IMAGEINFO, MSG_GET, &postTransferInfo));
-                    if (postTransferInfo.ImageWidth != transferredWidth ||
-                        postTransferInfo.ImageLength != transferredHeight ||
-                        postTransferInfo.BitsPerPixel != transferredBitsPerPixel)
+                        "DAT_PENDINGXFERS/MSG_ENDXFER",
+                        entry(&app, DG_CONTROL, DAT_PENDINGXFERS, MSG_ENDXFER, &pendingTransfers));
+                    if (pendingTransfers.Count != 0)
                     {
                         std::printf(
-                            "DAT_IMAGEINFO/MSG_GET after native xfer: expected %ld x %ld %u bpp, got %ld x %ld %d bpp\n",
-                            static_cast<long>(transferredWidth),
-                            static_cast<long>(transferredHeight),
-                            transferredBitsPerPixel,
-                            static_cast<long>(postTransferInfo.ImageWidth),
-                            static_cast<long>(postTransferInfo.ImageLength),
-                            postTransferInfo.BitsPerPixel);
+                            "DAT_PENDINGXFERS/MSG_ENDXFER: expected 0 remaining, got %u\n",
+                            pendingTransfers.Count);
                         ++failures;
                     }
                 }
-                else
-                {
-                    std::printf(
-                        "DAT_IMAGENATIVEXFER/MSG_GET: expected XFERDONE, got rc=%u handle=%p\n",
-                        transferReturn,
-                        dib);
-                    ++failures;
-                }
             }
-
-            TW_PENDINGXFERS pendingTransfers{};
-            failures += ExpectSuccess(
-                "DAT_PENDINGXFERS/MSG_ENDXFER",
-                entry(&app, DG_CONTROL, DAT_PENDINGXFERS, MSG_ENDXFER, &pendingTransfers));
-            if (pendingTransfers.Count != 0)
+            else
             {
-                std::printf(
-                    "DAT_PENDINGXFERS/MSG_ENDXFER: expected 0 remaining, got %u\n",
-                    pendingTransfers.Count);
-                ++failures;
+                for (TW_UINT16 transferIndex = 0; transferIndex < expectedTransferTotal; ++transferIndex)
+                {
+                    char imageInfoLabel[64] = {};
+                    std::snprintf(
+                        imageInfoLabel,
+                        sizeof(imageInfoLabel),
+                        "DAT_IMAGEINFO/MSG_GET #%u",
+                        static_cast<unsigned>(transferIndex + 1));
+
+                    TW_IMAGEINFO imageInfo{};
+                    failures += ExpectSuccess(
+                        imageInfoLabel,
+                        entry(&app, DG_IMAGE, DAT_IMAGEINFO, MSG_GET, &imageInfo));
+                    if (imageInfo.ImageWidth <= 0 || imageInfo.ImageLength <= 0)
+                    {
+                        std::printf(
+                            "%s: invalid image size %ld x %ld\n",
+                            imageInfoLabel,
+                            static_cast<long>(imageInfo.ImageWidth),
+                            static_cast<long>(imageInfo.ImageLength));
+                        ++failures;
+                    }
+
+                    TW_HANDLE dib = nullptr;
+                    const TW_UINT16 transferReturn =
+                        entry(&app, DG_IMAGE, DAT_IMAGENATIVEXFER, MSG_GET, &dib);
+                    LONG transferredWidth = 0;
+                    LONG transferredHeight = 0;
+                    TW_UINT16 transferredBitsPerPixel = 0;
+                    if (transferReturn == TWRC_XFERDONE && dib != nullptr)
+                    {
+                        auto* header = static_cast<BITMAPINFOHEADER*>(GlobalLock(dib));
+                        if (header == nullptr ||
+                            header->biSize != sizeof(BITMAPINFOHEADER) ||
+                            header->biWidth <= 0 ||
+                            header->biHeight <= 0 ||
+                            header->biSizeImage == 0)
+                        {
+                            std::printf(
+                                "DAT_IMAGENATIVEXFER/MSG_GET #%u: invalid DIB\n",
+                                static_cast<unsigned>(transferIndex + 1));
+                            ++failures;
+                        }
+                        else
+                        {
+                            transferredWidth = header->biWidth;
+                            transferredHeight = header->biHeight;
+                            transferredBitsPerPixel = header->biBitCount;
+                            std::printf(
+                                "DAT_IMAGENATIVEXFER/MSG_GET #%u: XFERDONE %ld x %ld %u bpp\n",
+                                static_cast<unsigned>(transferIndex + 1),
+                                static_cast<long>(header->biWidth),
+                                static_cast<long>(header->biHeight),
+                                header->biBitCount);
+                        }
+
+                        if (header != nullptr)
+                        {
+                            GlobalUnlock(dib);
+                        }
+                        GlobalFree(dib);
+
+                        char postTransferLabel[80] = {};
+                        std::snprintf(
+                            postTransferLabel,
+                            sizeof(postTransferLabel),
+                            "DAT_IMAGEINFO/MSG_GET after native xfer #%u",
+                            static_cast<unsigned>(transferIndex + 1));
+
+                        TW_IMAGEINFO postTransferInfo{};
+                        failures += ExpectSuccess(
+                            postTransferLabel,
+                            entry(&app, DG_IMAGE, DAT_IMAGEINFO, MSG_GET, &postTransferInfo));
+                        if (postTransferInfo.ImageWidth != transferredWidth ||
+                            postTransferInfo.ImageLength != transferredHeight ||
+                            postTransferInfo.BitsPerPixel != transferredBitsPerPixel)
+                        {
+                            std::printf(
+                                "%s: expected %ld x %ld %u bpp, got %ld x %ld %d bpp\n",
+                                postTransferLabel,
+                                static_cast<long>(transferredWidth),
+                                static_cast<long>(transferredHeight),
+                                transferredBitsPerPixel,
+                                static_cast<long>(postTransferInfo.ImageWidth),
+                                static_cast<long>(postTransferInfo.ImageLength),
+                                postTransferInfo.BitsPerPixel);
+                            ++failures;
+                        }
+                    }
+                    else
+                    {
+                        std::printf(
+                            "DAT_IMAGENATIVEXFER/MSG_GET #%u: expected XFERDONE, got rc=%u handle=%p\n",
+                            static_cast<unsigned>(transferIndex + 1),
+                            transferReturn,
+                            dib);
+                        ++failures;
+                    }
+
+                    char endXferLabel[72] = {};
+                    std::snprintf(
+                        endXferLabel,
+                        sizeof(endXferLabel),
+                        "DAT_PENDINGXFERS/MSG_ENDXFER #%u",
+                        static_cast<unsigned>(transferIndex + 1));
+
+                    TW_PENDINGXFERS pendingTransfers{};
+                    failures += ExpectSuccess(
+                        endXferLabel,
+                        entry(&app, DG_CONTROL, DAT_PENDINGXFERS, MSG_ENDXFER, &pendingTransfers));
+                    const TW_UINT16 expectedRemaining =
+                        static_cast<TW_UINT16>(expectedTransferTotal - (transferIndex + 1));
+                    if (pendingTransfers.Count != expectedRemaining)
+                    {
+                        std::printf(
+                            "%s: expected %u remaining, got %u\n",
+                            endXferLabel,
+                            expectedRemaining,
+                            pendingTransfers.Count);
+                        ++failures;
+                    }
+                }
             }
         }
         else

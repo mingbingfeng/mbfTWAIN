@@ -359,6 +359,70 @@ function Run-UiDelayedReadySmoke([string]$Platform) {
     }
 }
 
+function Run-UiXferCountSmoke([string]$Platform) {
+    $outDir = Join-Path $Root "build\manual\$Platform\$Configuration"
+    $dsPath = Join-Path $outDir "mbfVirtualTwainDS.ds"
+    $smokePath = Join-Path $outDir "SmokeDsEntry.exe"
+    $fakeServerDll = Join-Path $Root "tools\FakeScannerPipeServer\bin\$Configuration\net10.0\mbfTwain.FakeScannerPipeServer.dll"
+    $imagePath = Join-Path $Root "build\test-assets\page1.bmp"
+    $stdoutLog = Join-Path $Root "build\verify-$Platform-ui-xfercount.out.log"
+    $stderrLog = Join-Path $Root "build\verify-$Platform-ui-xfercount.err.log"
+    Assert-File $dsPath "DS missing"
+    Assert-File $smokePath "SmokeDsEntry missing"
+    Assert-File $fakeServerDll "FakeScannerPipeServer missing"
+    Assert-File $imagePath "XferCount smoke image missing"
+
+    Get-Process -Name "mbfTwain.VirtualScannerConfig" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
+    Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
+
+    $server = Start-Process `
+        -FilePath "dotnet" `
+        -ArgumentList @(
+            $fakeServerDll,
+            "--image", $imagePath,
+            "--image", $imagePath,
+            "--image", $imagePath,
+            "--scan", "0",
+            "--scan-after-begin-delay-ms", "200",
+            "--connections", "120",
+            "--revision", "84"
+        ) `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -PassThru `
+        -WindowStyle Hidden
+
+    try {
+        Start-Sleep -Milliseconds 150
+        Write-Step "UI xfercount smoke $Platform"
+        Invoke-WithTemporaryEnvironment @{
+            MBF_TWAIN_FORCE_UI = "1"
+            MBF_SMOKE_EXPECT_XFERREADY = "1"
+            MBF_SMOKE_EXPECT_ENABLE_CALLBACK = "1"
+            MBF_SMOKE_EXPECT_PAPER_A3 = $null
+            MBF_SMOKE_SET_XFERCOUNT = "2"
+            MBF_SMOKE_EXPECT_TRANSFER_TOTAL = "2"
+            MBF_SMOKE_USE_MEMORY = $null
+        } {
+            Invoke-Checked {
+                & $smokePath $dsPath
+            } "$Platform xfercount SmokeDsEntry"
+        }
+    }
+    finally {
+        if ($null -ne $server -and -not $server.HasExited) {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            $server.WaitForExit()
+        }
+    }
+
+    if (-not (Select-String -LiteralPath $stderrLog -Pattern "HIDE_SCAN_UI" -Quiet)) {
+        throw "UI xfercount smoke $Platform did not observe HIDE_SCAN_UI before scan acknowledgement. See $stderrLog"
+    }
+}
+
 function Install-Platform([string]$Platform, [string]$Destination) {
     $source = Join-Path $Root "build\manual\$Platform\$Configuration"
     Assert-Directory $source "Source build output missing"
@@ -425,6 +489,8 @@ try {
         Run-Smoke "Win32"
         Run-UiDelayedReadySmoke "x64"
         Run-UiDelayedReadySmoke "Win32"
+        Run-UiXferCountSmoke "x64"
+        Run-UiXferCountSmoke "Win32"
     }
 
     Install-LocalTwain

@@ -19,6 +19,8 @@ ICAP_XFERMECH
 
 `ICAP_XFERMECH` 当前广告 `TWSX_NATIVE` 和 `TWSX_MEMORY`。
 
+`CAP_XFERCOUNT` 默认是 `-1`，表示连续扫描。若宿主设置为正数，DS 会把单次启用流程里的可传输图片数限制为该值；若 UI 或 IPC 一次提供了更多图片，超出的图片会在该次扫描里直接丢弃。
+
 ## 支持的消息
 
 可变能力支持：

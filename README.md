@@ -93,7 +93,9 @@ The UI clears the previous image list, shows itself, waits for image selection,
 then sends those images after the user clicks Start Scan. Once image transfer
 to the TWAIN host starts, the DS asks the UI to hide without clearing its
 session state. After the final transfer is acknowledged, the UI clears the list
-and remains hidden until the next scan.
+and remains hidden until the next scan. If the host sets `CAP_XFERCOUNT` to a
+positive value, the DS only transfers that many images in the current session
+and discards any additional selected images.
 
 For an installed TWAIN source, copy the `.ds` file and the
 `mbfTwain.VirtualScannerConfig.*` runtime files into the same TWAIN source

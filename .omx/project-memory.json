@@ -1,0 +1,8 @@
+{
+  "notes": [
+    {
+      "category": "test",
+      "content": "NTwain real smoke harness for validating the production-style event path lives under `build/NtwainRealSmoke`. It references `E:\\Work\\scan_project\\packages\\NTwain.3.7.5\\lib\\net462\\NTwain.dll`, targets x86 `net8.0-windows`, opens the installed `mbf Virtual TWAIN Scanner` from `C:\\Windows\\twain_32`, and verifies `TwainSession.TransferReady` plus `DataTransferred native=True`. Typical run: build `build\\NtwainRealSmoke\\NtwainRealSmoke.csproj`, start `tools\\FakeScannerPipeServer\\bin\\Release\\net10.0\\mbfTwain.FakeScannerPipeServer.dll` with `--image build\\test-assets\\page1.bmp --scan 0 --scan-after-begin-delay-ms 500 --connections 120 --revision <n>`, set `MBF_TWAIN_FORCE_UI=1`, then run `build\\NtwainRealSmoke\\bin\\Release\\net8.0-windows\\NtwainRealSmoke.exe`. This caught the TWAIN protocol gap where NTwain queries `DAT_XFERGROUP/MSG_GET` and `DAT_PENDINGXFERS/MSG_GET` after `MSG_XFERREADY`."
+    }
+  ]
+}
