@@ -35,7 +35,7 @@ public sealed class MainForm : Form
         MinimumSize = new Size(760, 520);
         StartPosition = FormStartPosition.CenterScreen;
 
-        pipeServer = new ScannerPipeServer(GetSnapshot, BeginScanSession, AcknowledgeScan);
+        pipeServer = new ScannerPipeServer(GetSnapshot, BeginScanSession, HideScanUi, AcknowledgeScan);
         BuildLayout();
         UpdateStateFromControls(incrementRevision: false);
         pipeServer.Start();
@@ -407,6 +407,28 @@ public sealed class MainForm : Form
             UpdateStatus();
             Hide();
             DiagnosticsLog.Write("UI", "AcknowledgeScan applied and window hidden");
+        }));
+    }
+
+    private void HideScanUi(uint acknowledgedRevision)
+    {
+        DiagnosticsLog.Write("UI", $"HideScanUi requested revision={acknowledgedRevision}");
+        bool shouldHide;
+        lock (stateLock)
+        {
+            shouldHide = acknowledgedRevision == 0 || (scanRequested && acknowledgedRevision <= revision);
+        }
+
+        if (!shouldHide)
+        {
+            DiagnosticsLog.Write("UI", "HideScanUi ignored because current state did not match");
+            return;
+        }
+
+        BeginInvoke((MethodInvoker)(() =>
+        {
+            Hide();
+            DiagnosticsLog.Write("UI", "HideScanUi applied and window hidden");
         }));
     }
 

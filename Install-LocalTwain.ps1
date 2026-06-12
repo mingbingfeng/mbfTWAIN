@@ -353,6 +353,10 @@ function Run-UiDelayedReadySmoke([string]$Platform) {
             $server.WaitForExit()
         }
     }
+
+    if (-not (Select-String -LiteralPath $stderrLog -Pattern "HIDE_SCAN_UI" -Quiet)) {
+        throw "UI delayed-ready smoke $Platform did not observe HIDE_SCAN_UI before scan acknowledgement. See $stderrLog"
+    }
 }
 
 function Install-Platform([string]$Platform, [string]$Destination) {

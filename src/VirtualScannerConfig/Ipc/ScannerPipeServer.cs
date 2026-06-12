@@ -14,6 +14,7 @@ public sealed class ScannerPipeServer : IDisposable
 
     private readonly Func<ScannerStateSnapshot> getSnapshot;
     private readonly Action<ScannerSessionSettings?> beginScan;
+    private readonly Action<uint> hideScanUi;
     private readonly Action<uint> acknowledgeScan;
     private readonly CancellationTokenSource cancellation = new();
     private Task? serverTask;
@@ -21,10 +22,12 @@ public sealed class ScannerPipeServer : IDisposable
     public ScannerPipeServer(
         Func<ScannerStateSnapshot> getSnapshot,
         Action<ScannerSessionSettings?> beginScan,
+        Action<uint> hideScanUi,
         Action<uint> acknowledgeScan)
     {
         this.getSnapshot = getSnapshot;
         this.beginScan = beginScan;
+        this.hideScanUi = hideScanUi;
         this.acknowledgeScan = acknowledgeScan;
     }
 
@@ -124,6 +127,16 @@ public sealed class ScannerPipeServer : IDisposable
         }
 
         const string ackPrefix = "ACK_SCAN ";
+        const string hidePrefix = "HIDE_SCAN_UI ";
+        if (command.StartsWith(hidePrefix, StringComparison.Ordinal) &&
+            uint.TryParse(command.AsSpan(hidePrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out uint hideRevision))
+        {
+            DiagnosticsLog.Write("UI-IPC", $"HIDE_SCAN_UI accepted revision={hideRevision}");
+            hideScanUi(hideRevision);
+            await writer.WriteAsync("OK HIDE\n").ConfigureAwait(false);
+            return;
+        }
+
         if (command.StartsWith(ackPrefix, StringComparison.Ordinal) &&
             uint.TryParse(command.AsSpan(ackPrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out uint revision))
         {

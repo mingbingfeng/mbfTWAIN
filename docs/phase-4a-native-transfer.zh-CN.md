@@ -23,6 +23,7 @@ DG_IMAGE / DAT_IMAGENATIVEXFER / MSG_GET
   -> WIC 解码 PNG/JPG/BMP/TIFF 等 Windows 支持的图片
   -> 生成 packed DIB HGLOBAL
   -> 返回 TWRC_XFERDONE
+  -> 通知 UI 执行 HIDE_SCAN_UI，只隐藏窗口，不清空扫描状态
   -> State 6 转 State 7
 
 DG_CONTROL / DAT_SETUPMEMXFER / MSG_GET
@@ -32,7 +33,7 @@ DG_IMAGE / DAT_IMAGEMEMXFER / MSG_GET
   -> WIC 解码为 top-down raster
   -> 按应用提供的 TW_MEMORY buffer 分块写入完整行
   -> 非最后一块返回 TWRC_SUCCESS
-  -> 最后一块返回 TWRC_XFERDONE
+  -> 最后一块通知 UI 执行 HIDE_SCAN_UI 并返回 TWRC_XFERDONE
 
 DAT_PENDINGXFERS / MSG_ENDXFER
   -> 返回剩余页数

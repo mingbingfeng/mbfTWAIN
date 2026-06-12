@@ -102,6 +102,8 @@ private:
     bool TryResolveImageInfoIndex(TW_UINT32& imageIndex) const noexcept;
     bool EnsureMemoryTransferReady();
     void ResetMemoryTransfer() noexcept;
+    void HideScanUiSession();
+    void HideScanUiIfTransferStarted();
     void ClearTransferProgress() noexcept;
     void AcknowledgeScanIfComplete();
 
@@ -119,6 +121,7 @@ private:
     ScannerSettings settings_{};
     bool transferReady_ = false;
     bool transferReadyNotified_ = false;
+    bool scanUiHiddenForCurrentTransfer_ = false;
     std::uint32_t pendingIpcRevision_ = 0;
     TW_UINT32 pendingTransferIndex_ = 0;
     bool hasCurrentTransferImage_ = false;

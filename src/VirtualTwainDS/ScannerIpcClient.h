@@ -37,6 +37,7 @@ public:
     bool BeginScan(DWORD timeoutMilliseconds = 150) const;
     bool BeginScan(const ScannerIpcState& initialState, DWORD timeoutMilliseconds = 150) const;
     bool TryGetState(ScannerIpcState& state, DWORD timeoutMilliseconds = 150) const;
+    bool HideScanUi(std::uint32_t revision, DWORD timeoutMilliseconds = 150) const;
     bool AcknowledgeScan(std::uint32_t revision, DWORD timeoutMilliseconds = 150) const;
 
 private:

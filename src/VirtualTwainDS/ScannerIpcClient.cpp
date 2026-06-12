@@ -262,6 +262,13 @@ bool ScannerIpcClient::TryGetState(ScannerIpcState& state, DWORD timeoutMillisec
            ParseStateResponse(response, state);
 }
 
+bool ScannerIpcClient::HideScanUi(std::uint32_t revision, DWORD timeoutMilliseconds) const
+{
+    std::string response;
+    return SendCommand("HIDE_SCAN_UI " + std::to_string(revision) + "\n", response, timeoutMilliseconds) &&
+           response == "OK HIDE\n";
+}
+
 bool ScannerIpcClient::AcknowledgeScan(std::uint32_t revision, DWORD timeoutMilliseconds) const
 {
     std::string response;

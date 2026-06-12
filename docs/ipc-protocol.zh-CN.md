@@ -64,6 +64,12 @@ ACK_SCAN 3
 
 当 DS 已消费某次扫描请求后发送。若 revision 匹配，UI 清除 `scan` 标记并递增 revision。
 
+```text
+HIDE_SCAN_UI 3
+```
+
+当 DS 已经把当前扫描请求的图片交给 TWAIN 宿主后发送。若 revision 匹配，UI 只隐藏窗口，不清空图片列表，也不清除 `scan` 标记；最终清理由后续 `ACK_SCAN` 完成。`HIDE_SCAN_UI 0` 表示禁用或关闭 Source 时的兜底隐藏。这样宿主在收到图片后继续做纠偏、识别或 Loading 时，虚拟驱动 UI 不会继续停留在前台。
+
 ## 字段
 
 - `revision`：UI 状态版本，任意设置变化都会递增。

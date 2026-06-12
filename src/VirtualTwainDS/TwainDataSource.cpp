@@ -918,6 +918,15 @@ TW_UINT16 VirtualTwainDataSource::HandleIdentity(
             return Fail(TWCC_SEQERROR);
         }
 
+        if (pendingIpcRevision_ != 0)
+        {
+            AcknowledgeScanIfComplete();
+        }
+        else
+        {
+            HideScanUiSession();
+        }
+
         state_ = TwainState::SourceLoaded;
         StopTransferReadyWatcher();
         openOrigin_.reset();
@@ -998,6 +1007,7 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
 
         transferReady_ = false;
         transferReadyNotified_ = false;
+        scanUiHiddenForCurrentTransfer_ = false;
         ClearTransferProgress();
         state_ = TwainState::SourceEnabled;
 
@@ -1037,6 +1047,14 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
         transferReady_ = false;
         transferReadyNotified_ = false;
         StopTransferReadyWatcher();
+        if (pendingIpcRevision_ != 0)
+        {
+            AcknowledgeScanIfComplete();
+        }
+        else
+        {
+            HideScanUiSession();
+        }
         ClearTransferProgress();
         state_ = TwainState::SourceOpened;
         return Succeed();
@@ -1298,6 +1316,7 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(TW_UINT16 message, T
     hasCurrentTransferImage_ = true;
     state_ = TwainState::Transferring;
     transferReady_ = pendingTransferIndex_ < pendingImages_.size();
+    HideScanUiIfTransferStarted();
     lastStatus_.ConditionCode = TWCC_SUCCESS;
     lastStatus_.Data = 0;
     return TWRC_XFERDONE;
@@ -1374,6 +1393,7 @@ TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(TW_UINT16 message, T
         ++pendingTransferIndex_;
         transferReady_ = pendingTransferIndex_ < pendingImages_.size();
         ResetMemoryTransfer();
+        HideScanUiIfTransferStarted();
         return TWRC_XFERDONE;
     }
 
@@ -1892,6 +1912,7 @@ void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcSta
     pendingTransferIndex_ = 0;
     hasCurrentTransferImage_ = false;
     currentTransferImageIndex_ = 0;
+    scanUiHiddenForCurrentTransfer_ = false;
     transferReadyNotified_ = false;
     ResetMemoryTransfer();
     pendingImages_ = std::move(ipcState.selectedImages);
@@ -2324,6 +2345,31 @@ void VirtualTwainDataSource::ResetMemoryTransfer() noexcept
     memoryTransfer_.image = RasterImage{};
 }
 
+void VirtualTwainDataSource::HideScanUiSession()
+{
+    const std::uint32_t revision = pendingIpcRevision_;
+    ScannerIpcClient client;
+    const bool hidden = client.HideScanUi(revision, 30);
+    diagnostics::AppendLine(
+        L"DS",
+        L"HideScanUi revision=" + std::to_wstring(revision) +
+            L" success=" + std::to_wstring(hidden ? 1U : 0U));
+    if (hidden && revision != 0)
+    {
+        scanUiHiddenForCurrentTransfer_ = true;
+    }
+}
+
+void VirtualTwainDataSource::HideScanUiIfTransferStarted()
+{
+    if (pendingIpcRevision_ == 0 || scanUiHiddenForCurrentTransfer_)
+    {
+        return;
+    }
+
+    HideScanUiSession();
+}
+
 void VirtualTwainDataSource::ClearTransferProgress() noexcept
 {
     pendingImages_.clear();
@@ -2331,6 +2377,7 @@ void VirtualTwainDataSource::ClearTransferProgress() noexcept
     pendingTransferIndex_ = 0;
     hasCurrentTransferImage_ = false;
     currentTransferImageIndex_ = 0;
+    scanUiHiddenForCurrentTransfer_ = false;
     ResetMemoryTransfer();
 }
 

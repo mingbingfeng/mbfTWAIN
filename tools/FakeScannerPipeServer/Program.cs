@@ -112,6 +112,15 @@ internal static class Program
                 continue;
             }
 
+            const string hidePrefix = "HIDE_SCAN_UI ";
+            if (command is not null &&
+                command.StartsWith(hidePrefix, StringComparison.Ordinal) &&
+                uint.TryParse(command.AsSpan(hidePrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out _))
+            {
+                writer.Write("OK HIDE\n");
+                continue;
+            }
+
             const string ackPrefix = "ACK_SCAN ";
             if (command is not null &&
                 command.StartsWith(ackPrefix, StringComparison.Ordinal) &&
