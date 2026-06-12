@@ -57,6 +57,7 @@ constexpr std::array<TW_UINT16, 3> kPixelTypeValues = {TWPT_BW, TWPT_GRAY, TWPT_
 constexpr std::array<TW_UINT16, 2> kTransferMechanismValues = {TWSX_NATIVE, TWSX_MEMORY};
 constexpr std::array<TW_UINT16, 2> kSupportedSizesValues = {TWSS_A4LETTER, TWSS_A3};
 constexpr std::array<TW_INT16, 4> kResolutionWholeValues = {150, 200, 300, 600};
+constexpr std::uint32_t kUiStateFailureThreshold = 3;
 
 constexpr TW_UINT32 kMutableCapabilitySupport =
     TWQC_GET | TWQC_SET | TWQC_GETDEFAULT | TWQC_GETCURRENT | TWQC_RESET;
@@ -1007,6 +1008,9 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
 
         transferReady_ = false;
         transferReadyNotified_ = false;
+        awaitingUiSelection_ = false;
+        closeDsRequest_ = false;
+        closeDsRequestNotified_ = false;
         scanUiHiddenForCurrentTransfer_ = false;
         ClearTransferProgress();
         state_ = TwainState::SourceEnabled;
@@ -1028,6 +1032,7 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
         }
         else if (shouldShowUi && message == MSG_ENABLEDS)
         {
+            awaitingUiSelection_ = true;
             StartTransferReadyWatcher();
         }
 
@@ -1083,9 +1088,18 @@ TW_UINT16 VirtualTwainDataSource::HandleEvent(TW_UINT16 message, TW_MEMREF data)
 
     event->TWMessage = MSG_NULL;
 
-    if (!transferReady_)
+    if (!transferReady_ && !closeDsRequest_)
     {
         transferReady_ = RefreshTransferReadyFromIpc();
+    }
+
+    if (closeDsRequest_)
+    {
+        RollbackCanceledUiEnable();
+        event->TWMessage = MSG_CLOSEDSREQ;
+        lastStatus_.ConditionCode = TWCC_SUCCESS;
+        lastStatus_.Data = 0;
+        return TWRC_DSEVENT;
     }
 
     if (transferReady_)
@@ -1170,6 +1184,9 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
         pendingTransfers->EOJ = 0;
         transferReady_ = false;
         transferReadyNotified_ = false;
+        awaitingUiSelection_ = false;
+        closeDsRequest_ = false;
+        closeDsRequestNotified_ = false;
         pendingTransferIndex_ = 0;
         pendingImages_.clear();
         hasCurrentTransferImage_ = false;
@@ -1912,6 +1929,9 @@ void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcSta
     pendingTransferIndex_ = 0;
     hasCurrentTransferImage_ = false;
     currentTransferImageIndex_ = 0;
+    awaitingUiSelection_ = false;
+    closeDsRequest_ = false;
+    closeDsRequestNotified_ = false;
     scanUiHiddenForCurrentTransfer_ = false;
     transferReadyNotified_ = false;
     ResetMemoryTransfer();
@@ -2021,6 +2041,8 @@ void VirtualTwainDataSource::TransferReadyWatcherLoop()
     bool lastScanRequested = false;
     size_t lastImageCount = 0;
     std::uint64_t loggedGeneration = 0;
+    std::uint64_t failureGeneration = 0;
+    std::uint32_t consecutiveGetStateFailures = 0;
 
     diagnostics::AppendLine(L"DS", L"Transfer ready watcher thread entered");
 
@@ -2052,12 +2074,84 @@ void VirtualTwainDataSource::TransferReadyWatcherLoop()
             }
         }
 
+        if (failureGeneration != generation)
+        {
+            failureGeneration = generation;
+            consecutiveGetStateFailures = 0;
+        }
+
         ScannerIpcState ipcState{};
         if (!client.TryGetState(ipcState, 150))
         {
+            bool shouldNotifyCloseRequest = false;
+            TW_ENTRYPOINT closeRequestEntryPoint{};
+            TW_IDENTITY closeRequestSourceIdentity{};
+            TW_IDENTITY closeRequestAppIdentity{};
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!transferReadyWatcherStop_ &&
+                    transferReadyWatcherActive_ &&
+                    generation == transferReadyWatcherGeneration_ &&
+                    state_ == TwainState::SourceEnabled &&
+                    !transferReady_ &&
+                    awaitingUiSelection_ &&
+                    !closeDsRequest_)
+                {
+                    ++consecutiveGetStateFailures;
+                    diagnostics::AppendLine(
+                        L"DS",
+                        L"Transfer ready watcher GET_STATE failed while awaiting UI selection failures=" +
+                            std::to_wstring(consecutiveGetStateFailures));
+                    if (consecutiveGetStateFailures >= kUiStateFailureThreshold)
+                    {
+                        awaitingUiSelection_ = false;
+                        closeDsRequest_ = true;
+                        transferReadyWatcherActive_ = false;
+                        ++transferReadyWatcherGeneration_;
+                        diagnostics::AppendLine(
+                            L"DS",
+                            L"Transfer ready watcher treating missing UI pipe as canceled session; requesting MSG_CLOSEDSREQ");
+                        if (!closeDsRequestNotified_ && entryPoint_.DSM_Entry != nullptr && openOrigin_.has_value())
+                        {
+                            shouldNotifyCloseRequest = true;
+                            closeRequestEntryPoint = entryPoint_;
+                            closeRequestSourceIdentity = identity_;
+                            closeRequestAppIdentity = *openOrigin_;
+                        }
+                    }
+                }
+            }
+
+            if (shouldNotifyCloseRequest)
+            {
+                const TW_UINT16 rc = closeRequestEntryPoint.DSM_Entry(
+                    &closeRequestSourceIdentity,
+                    &closeRequestAppIdentity,
+                    DG_CONTROL,
+                    DAT_NULL,
+                    MSG_CLOSEDSREQ,
+                    nullptr);
+
+                diagnostics::AppendLine(
+                    L"DS",
+                    L"NotifyCloseDsRequest DAT_NULL/MSG_CLOSEDSREQ rc=" + std::to_wstring(rc) +
+                        L" sourceId=" + std::to_wstring(closeRequestSourceIdentity.Id) +
+                        L" appId=" + std::to_wstring(closeRequestAppIdentity.Id));
+
+                if (rc == TWRC_SUCCESS)
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (closeDsRequest_)
+                    {
+                        closeDsRequestNotified_ = true;
+                    }
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(75));
             continue;
         }
+
+        consecutiveGetStateFailures = 0;
 
         bool shouldNotify = false;
         std::uint32_t notificationRevision = 0;
@@ -2392,6 +2486,9 @@ void VirtualTwainDataSource::ClearTransferProgress() noexcept
     pendingTransferIndex_ = 0;
     hasCurrentTransferImage_ = false;
     currentTransferImageIndex_ = 0;
+    awaitingUiSelection_ = false;
+    closeDsRequest_ = false;
+    closeDsRequestNotified_ = false;
     scanUiHiddenForCurrentTransfer_ = false;
     ResetMemoryTransfer();
 }
@@ -2410,6 +2507,19 @@ void VirtualTwainDataSource::AcknowledgeScanIfComplete()
         L"AcknowledgeScan revision=" + std::to_wstring(pendingIpcRevision_) +
             L" success=" + std::to_wstring(acknowledged ? 1U : 0U));
     pendingIpcRevision_ = 0;
+}
+
+void VirtualTwainDataSource::RollbackCanceledUiEnable()
+{
+    diagnostics::AppendLine(
+        L"DS",
+        L"RollbackCanceledUiEnable transitioning from state=" + TwainStateName(state_) +
+            L" after UI cancellation");
+    transferReady_ = false;
+    transferReadyNotified_ = false;
+    StopTransferReadyWatcher();
+    ClearTransferProgress();
+    state_ = TwainState::SourceOpened;
 }
 
 TW_UINT16 VirtualTwainDataSource::Succeed(TW_UINT16 conditionCode) noexcept

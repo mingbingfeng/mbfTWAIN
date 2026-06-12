@@ -372,11 +372,6 @@ internal static class Program
             }
         }
 
-        if (images.Count == 0)
-        {
-            return Fail("At least one --image path is required", out options, out error);
-        }
-
         options = new Options(
             pipeName,
             revision,
@@ -423,6 +418,6 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.Error.WriteLine(
-            "Usage: FakeScannerPipeServer --image <path> [--connections 3] [--pixel RGB|GRAY|BW] [--paper A4|A3] [--revision n] [--scan-after-begin-delay-ms n]");
+            "Usage: FakeScannerPipeServer [--image <path>]... [--connections 3] [--pixel RGB|GRAY|BW] [--paper A4|A3] [--revision n] [--scan-after-begin-delay-ms n]");
     }
 }

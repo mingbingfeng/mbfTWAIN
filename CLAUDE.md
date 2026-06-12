@@ -35,6 +35,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-LocalTwain.ps1
 - **状态文件驱动等待**：Claude 工作中，Codex 低频检查小状态 JSON；不要为了“看看进展”读取长原始输出。
 - **不截图作证据**：可视化 Claude Code 窗口由用户直接观察，不保存截图作为常规证据。
 - **最终责任不外包**：Codex 必须复核授权范围、关键 diff、验证结果和安装结果，不能只转述 Claude 的结论。
+- **Claude 默认可视**：凡在本仓库启用 Claude Code 协作，默认必须启动可见的交互式 Claude Code 会话；只有用户明确要求后台、非交互或机器可消费输出时，才允许例外。不得擅自退化为 `claude -p`、后台 print 模式或仅保留日志文件。
+- **协议偏差当场纠正**：如果当前协作方式偏离用户要求或本协议，Codex 必须在当前任务立即修正，不要用“下次改进”替代本次纠偏。
+- **正常路径节流**：在 `status=ok` 且状态 JSON 已足够说明结论时，Codex 默认只读取状态 JSON，不读取 Claude 全量对话、stream-json 或冗长报告。
 
 ## 何时委托
 
@@ -68,6 +71,7 @@ Codex 直接处理：
 - **实现 lane**：Claude 可做边界明确的批量改动；Codex 复核 diff。
 - **补盲 lane**：Codex 写完最小修复后，可让 Claude 只查遗漏路径、异常路径或测试缺口。
 - **验收 lane**：Codex 负责最终 `git diff --check`、构建、smoke、安装和汇报。
+- **Claude lane 默认可视**：只要启用 Claude Code，Codex 就负责准备任务包并启动可见窗口；之后以状态 JSON 协调，不要再用后台模式偷偷替代。
 
 ## 落盘结构
 
@@ -86,15 +90,18 @@ Codex 直接处理：
 默认使用可视化聊天窗口：
 
 ```powershell
-cd E:\Project\mbfTwain
+cd <repo-root>
 claude --dangerously-skip-permissions
 ```
 
+- 只要使用 Claude Code 协作，上面的可视化启动方式就是**强制要求**，不是建议项。
 - 默认不要使用 `claude -p`、`--output-format stream-json`、`--include-partial-messages`、`--include-hook-events`。
+- 只有当用户明确接受后台/非交互执行，或任务本身明确要求机器可消费输出时，才允许使用 `claude -p` 或其它非交互模式。
 - 如果未来用户明确要求恢复 `-p --output-format stream-json`，必须同时带 `--verbose`，否则 Claude Code CLI 会报错：`When using --print, --output-format=stream-json requires --verbose`。
 - 任务包写入 `.codex_delegate/prompts/<task-id>.md`，启动窗口后提交给 Claude。
 - 不保存截图作为流程证据；如果窗口状态、粘贴提交或 Claude 是否卡住无法判断，Codex 应优先依赖状态 JSON，仍不确定时通过 Codex App 询问窗口或短消息问用户。
 - 禁止把 `.stream.jsonl`、debug log、完整对话转储作为主流程输入。
+- 不得为了省 token、图方便或减少手动操作，而把默认可视的 Claude 协作偷偷改成后台模式。
 
 ## 状态 JSON 与等待机制
 
@@ -146,6 +153,7 @@ Codex 等待规则：
 - `status=ok`：读取小状态 JSON 后进入 Codex 验收，不读取详细报告。
 - `updated_at` 5-10 分钟无变化：视为可能卡住，优先回到 Claude 会话追加一句状态请求；仍无法判断时通过 Codex App 询问窗口或短消息问用户。
 - 任务超过预期预算或 Claude 明显等待人工输入：Codex 自行接手或询问用户，不静默等待。
+- Claude 已接手调查 lane 后，Codex 不要在等待期间并行做同一批搜索；只有在状态停滞、授权越界或结论明显不可信时才接管重查。
 
 只有这些情况才读详细报告或长日志尾部：
 
@@ -223,6 +231,7 @@ Codex 可以自动重试同一 Claude 子任务，最多 2 次：
 - 报告缺失但状态声明需要报告。
 - 构建或测试失败且错误局部、可修复。
 - Claude 改动超出范围但可通过补充指令收敛。
+- 启动方式违反本协议，例如本应使用默认可见聊天窗口却误用了后台/非交互模式。
 
 超过 2 次后，Codex 自行接手或向用户报告明确阻塞。
 

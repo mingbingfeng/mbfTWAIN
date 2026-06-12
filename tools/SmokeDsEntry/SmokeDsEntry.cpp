@@ -26,9 +26,27 @@ using DsEntry = TW_UINT16(TW_CALLINGSTYLE*)(
     TW_UINT16 message,
     TW_MEMREF data);
 
-std::atomic_bool g_sawXferReadyCallback{false};
-std::atomic<TW_UINT32> g_xferReadySourceId{0};
-std::atomic<TW_UINT32> g_xferReadyAppId{0};
+std::atomic_bool g_sawCallback{false};
+std::atomic<TW_UINT16> g_callbackMessage{MSG_NULL};
+std::atomic<TW_UINT32> g_callbackSourceId{0};
+std::atomic<TW_UINT32> g_callbackAppId{0};
+
+const char* DsMessageName(TW_UINT16 message)
+{
+    switch (message)
+    {
+    case MSG_XFERREADY:
+        return "MSG_XFERREADY";
+    case MSG_CLOSEDSREQ:
+        return "MSG_CLOSEDSREQ";
+    case MSG_CLOSEDSOK:
+        return "MSG_CLOSEDSOK";
+    case MSG_NULL:
+        return "MSG_NULL";
+    default:
+        return "MSG_UNKNOWN";
+    }
+}
 
 TW_UINT16 TW_CALLINGSTYLE SmokeDsmEntry(
     pTW_IDENTITY origin,
@@ -42,13 +60,15 @@ TW_UINT16 TW_CALLINGSTYLE SmokeDsmEntry(
         destination != nullptr &&
         dataGroup == DG_CONTROL &&
         dataArgumentType == DAT_NULL &&
-        message == MSG_XFERREADY)
+        (message == MSG_XFERREADY || message == MSG_CLOSEDSREQ || message == MSG_CLOSEDSOK))
     {
-        g_xferReadySourceId.store(origin->Id);
-        g_xferReadyAppId.store(destination->Id);
-        g_sawXferReadyCallback.store(true);
+        g_callbackSourceId.store(origin->Id);
+        g_callbackAppId.store(destination->Id);
+        g_callbackMessage.store(message);
+        g_sawCallback.store(true);
         std::printf(
-            "DSM DAT_NULL/MSG_XFERREADY: sourceId=%lu appId=%lu\n",
+            "DSM DAT_NULL/%s: sourceId=%lu appId=%lu\n",
+            DsMessageName(message),
             static_cast<unsigned long>(origin->Id),
             static_cast<unsigned long>(destination->Id));
         return TWRC_SUCCESS;
@@ -83,10 +103,10 @@ void TW_CALLINGSTYLE SmokeDsmMemUnlock(TW_HANDLE handle)
     }
 }
 
-bool WaitForXferReadyCallback(DWORD timeoutMilliseconds)
+bool WaitForCallbackMessage(TW_UINT16 expectedMessage, DWORD timeoutMilliseconds)
 {
     const ULONGLONG deadline = GetTickCount64() + timeoutMilliseconds;
-    while (!g_sawXferReadyCallback.load())
+    while (!g_sawCallback.load() || g_callbackMessage.load() != expectedMessage)
     {
         const ULONGLONG now = GetTickCount64();
         if (now >= deadline)
@@ -342,6 +362,35 @@ int ExpectFailure(const char* label, TW_UINT16 returnCode)
     }
 
     std::printf("%s: expected failure, got return code %u\n", label, returnCode);
+    return 1;
+}
+
+int ExpectStatusCondition(
+    const char* label,
+    DsEntry entry,
+    TW_IDENTITY& app,
+    TW_UINT16 expectedConditionCode)
+{
+    TW_STATUS status{};
+    const int failures = ExpectSuccess(
+        label,
+        entry(&app, DG_CONTROL, DAT_STATUS, MSG_GET, &status));
+    if (failures != 0)
+    {
+        return failures;
+    }
+
+    if (status.ConditionCode == expectedConditionCode)
+    {
+        std::printf("%s: condition=%u\n", label, status.ConditionCode);
+        return 0;
+    }
+
+    std::printf(
+        "%s: expected condition %u, got %u\n",
+        label,
+        expectedConditionCode,
+        status.ConditionCode);
     return 1;
 }
 
@@ -714,9 +763,16 @@ int wmain(int argc, wchar_t** argv)
 
     TW_USERINTERFACE userInterface{};
     const bool expectXferReady = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_XFERREADY");
+    const bool expectCloseDsReq = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_CLOSEDSREQ");
     const bool expectEnableCallback = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_ENABLE_CALLBACK");
     const bool expectPaperA3 = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_PAPER_A3");
-    userInterface.ShowUI = expectXferReady ? TRUE : FALSE;
+    if (expectXferReady && expectCloseDsReq)
+    {
+        std::printf("MBF_SMOKE_EXPECT_XFERREADY and MBF_SMOKE_EXPECT_CLOSEDSREQ cannot both be set\n");
+        ++failures;
+    }
+
+    userInterface.ShowUI = (expectXferReady || expectCloseDsReq) ? TRUE : FALSE;
     userInterface.ModalUI = FALSE;
     failures += ExpectSuccess(
         "DAT_USERINTERFACE/MSG_ENABLEDS",
@@ -724,13 +780,18 @@ int wmain(int argc, wchar_t** argv)
 
     if (expectEnableCallback)
     {
-        if (WaitForXferReadyCallback(2500))
+        const TW_UINT16 expectedCallbackMessage = expectCloseDsReq ? MSG_CLOSEDSREQ : MSG_XFERREADY;
+        if (WaitForCallbackMessage(expectedCallbackMessage, 2500))
         {
-            std::printf("DSM DAT_NULL/MSG_XFERREADY: observed before first DAT_EVENT\n");
+            std::printf(
+                "DSM DAT_NULL/%s: observed before first DAT_EVENT\n",
+                DsMessageName(expectedCallbackMessage));
         }
         else
         {
-            std::printf("DSM DAT_NULL/MSG_XFERREADY: timed out before first DAT_EVENT\n");
+            std::printf(
+                "DSM DAT_NULL/%s: timed out before first DAT_EVENT\n",
+                DsMessageName(expectedCallbackMessage));
             ++failures;
         }
     }
@@ -742,17 +803,17 @@ int wmain(int argc, wchar_t** argv)
         if (eventReturn == TWRC_DSEVENT && event.TWMessage == MSG_XFERREADY)
         {
             std::printf("DAT_EVENT/MSG_PROCESSEVENT: MSG_XFERREADY\n");
-            if (!g_sawXferReadyCallback.load())
+            if (!g_sawCallback.load() || g_callbackMessage.load() != MSG_XFERREADY)
             {
                 std::printf("DSM DAT_NULL/MSG_XFERREADY: callback was not observed\n");
                 ++failures;
             }
-            if (g_xferReadySourceId.load() != 17 || g_xferReadyAppId.load() != 41)
+            if (g_callbackSourceId.load() != 17 || g_callbackAppId.load() != 41)
             {
                 std::printf(
                     "DSM DAT_NULL/MSG_XFERREADY: unexpected ids source=%lu app=%lu\n",
-                    static_cast<unsigned long>(g_xferReadySourceId.load()),
-                    static_cast<unsigned long>(g_xferReadyAppId.load()));
+                    static_cast<unsigned long>(g_callbackSourceId.load()),
+                    static_cast<unsigned long>(g_callbackAppId.load()));
                 ++failures;
             }
 
@@ -1007,6 +1068,44 @@ int wmain(int argc, wchar_t** argv)
         {
             std::printf(
                 "DAT_EVENT/MSG_PROCESSEVENT: expected XFERREADY, got rc=%u message=%u\n",
+                eventReturn,
+                event.TWMessage);
+            ++failures;
+        }
+    }
+    else if (expectCloseDsReq)
+    {
+        if (eventReturn == TWRC_DSEVENT && event.TWMessage == MSG_CLOSEDSREQ)
+        {
+            std::printf("DAT_EVENT/MSG_PROCESSEVENT: MSG_CLOSEDSREQ\n");
+            if (!g_sawCallback.load() || g_callbackMessage.load() != MSG_CLOSEDSREQ)
+            {
+                std::printf("DSM DAT_NULL/MSG_CLOSEDSREQ: callback was not observed\n");
+                ++failures;
+            }
+            if (g_callbackSourceId.load() != 17 || g_callbackAppId.load() != 41)
+            {
+                std::printf(
+                    "DSM DAT_NULL/MSG_CLOSEDSREQ: unexpected ids source=%lu app=%lu\n",
+                    static_cast<unsigned long>(g_callbackSourceId.load()),
+                    static_cast<unsigned long>(g_callbackAppId.load()));
+                ++failures;
+            }
+
+            TW_EVENT secondEvent{};
+            failures += ExpectFailure(
+                "DAT_EVENT/MSG_PROCESSEVENT after CLOSEDSREQ",
+                entry(&app, DG_CONTROL, DAT_EVENT, MSG_PROCESSEVENT, &secondEvent));
+            failures += ExpectStatusCondition(
+                "DAT_STATUS/MSG_GET after CLOSEDSREQ",
+                entry,
+                app,
+                TWCC_SEQERROR);
+        }
+        else
+        {
+            std::printf(
+                "DAT_EVENT/MSG_PROCESSEVENT: expected CLOSEDSREQ, got rc=%u message=%u\n",
                 eventReturn,
                 event.TWMessage);
             ++failures;

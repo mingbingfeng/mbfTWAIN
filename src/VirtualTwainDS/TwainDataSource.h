@@ -106,6 +106,7 @@ private:
     void HideScanUiIfTransferStarted();
     void ClearTransferProgress() noexcept;
     void AcknowledgeScanIfComplete();
+    void RollbackCanceledUiEnable();
 
     TW_UINT16 Succeed(TW_UINT16 conditionCode = TWCC_SUCCESS) noexcept;
     TW_UINT16 Fail(TW_UINT16 conditionCode) noexcept;
@@ -121,6 +122,9 @@ private:
     ScannerSettings settings_{};
     bool transferReady_ = false;
     bool transferReadyNotified_ = false;
+    bool awaitingUiSelection_ = false;
+    bool closeDsRequest_ = false;
+    bool closeDsRequestNotified_ = false;
     bool scanUiHiddenForCurrentTransfer_ = false;
     std::uint32_t pendingIpcRevision_ = 0;
     TW_UINT32 pendingTransferIndex_ = 0;
