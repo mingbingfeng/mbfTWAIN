@@ -2,6 +2,10 @@ using System.Collections.Generic;
 
 namespace MbfTwain.VirtualScannerConfig.Ipc;
 
+public sealed record ScannerImageSelection(
+    string Path,
+    int RotationDegrees);
+
 public sealed record ScannerStateSnapshot(
     uint Revision,
     bool DuplexEnabled,
@@ -10,7 +14,7 @@ public sealed record ScannerStateSnapshot(
     int XResolution,
     int YResolution,
     bool ScanRequested,
-    IReadOnlyList<string> SelectedImages);
+    IReadOnlyList<ScannerImageSelection> SelectedImages);
 
 public sealed record ScannerSessionSettings(
     bool DuplexEnabled,

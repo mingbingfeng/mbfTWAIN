@@ -165,6 +165,16 @@ bool TryReadEnvironmentLong(const wchar_t* name, long& value)
     return true;
 }
 
+LONG DpiToPixelsPerMeter(long dpi)
+{
+    if (dpi <= 0)
+    {
+        return 0;
+    }
+
+    return static_cast<LONG>((static_cast<unsigned long long>(dpi) * 10000ULL + 127ULL) / 254ULL);
+}
+
 void CopyTwainString(char* destination, size_t destinationSize, const char* source)
 {
     std::memset(destination, 0, destinationSize);
@@ -621,20 +631,56 @@ int wmain(int argc, wchar_t** argv)
         TWTY_UINT16,
         TWSS_A3);
 
+    long configuredXResolution = 600;
+    if (TryReadEnvironmentLong(L"MBF_SMOKE_SET_XRESOLUTION", configuredXResolution) &&
+        configuredXResolution <= 0)
+    {
+        std::printf("MBF_SMOKE_SET_XRESOLUTION: invalid value %ld\n", configuredXResolution);
+        ++failures;
+        configuredXResolution = 600;
+    }
+
+    long configuredYResolution = 0;
+    const bool hasConfiguredYResolution = TryReadEnvironmentLong(L"MBF_SMOKE_SET_YRESOLUTION", configuredYResolution);
+    if (hasConfiguredYResolution && configuredYResolution <= 0)
+    {
+        std::printf("MBF_SMOKE_SET_YRESOLUTION: invalid value %ld\n", configuredYResolution);
+        ++failures;
+        configuredYResolution = 0;
+    }
+
     failures += SetOneValue(
-        "ICAP_XRESOLUTION/SET 600",
+        "ICAP_XRESOLUTION/SET configured",
         entry,
         app,
         ICAP_XRESOLUTION,
         TWTY_FIX32,
-        PackFix32(MakeFix32(600)));
+        PackFix32(MakeFix32(static_cast<TW_INT16>(configuredXResolution))));
     failures += ExpectOneValue(
-        "ICAP_XRESOLUTION/current 600",
+        "ICAP_XRESOLUTION/current configured",
         entry,
         app,
         ICAP_XRESOLUTION,
         TWTY_FIX32,
-        PackFix32(MakeFix32(600)));
+        PackFix32(MakeFix32(static_cast<TW_INT16>(configuredXResolution))));
+
+    if (hasConfiguredYResolution)
+    {
+        failures += SetOneValue(
+            "ICAP_YRESOLUTION/SET configured",
+            entry,
+            app,
+            ICAP_YRESOLUTION,
+            TWTY_FIX32,
+            PackFix32(MakeFix32(static_cast<TW_INT16>(configuredYResolution))));
+        failures += ExpectOneValue(
+            "ICAP_YRESOLUTION/current configured",
+            entry,
+            app,
+            ICAP_YRESOLUTION,
+            TWTY_FIX32,
+            PackFix32(MakeFix32(static_cast<TW_INT16>(configuredYResolution))));
+    }
 
     if (useMemoryTransfer)
     {
@@ -766,9 +812,26 @@ int wmain(int argc, wchar_t** argv)
     const bool expectCloseDsReq = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_CLOSEDSREQ");
     const bool expectEnableCallback = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_ENABLE_CALLBACK");
     const bool expectPaperA3 = EnvironmentFlagEnabled(L"MBF_SMOKE_EXPECT_PAPER_A3");
+    long expectedImageXResolution = 0;
+    const bool hasExpectedImageXResolution =
+        TryReadEnvironmentLong(L"MBF_SMOKE_EXPECT_XRESOLUTION", expectedImageXResolution);
+    long expectedImageYResolution = expectedImageXResolution;
+    const bool hasExpectedImageYResolution =
+        TryReadEnvironmentLong(L"MBF_SMOKE_EXPECT_YRESOLUTION", expectedImageYResolution);
+    if (!hasExpectedImageXResolution && hasExpectedImageYResolution)
+    {
+        expectedImageXResolution = expectedImageYResolution;
+    }
     if (expectXferReady && expectCloseDsReq)
     {
         std::printf("MBF_SMOKE_EXPECT_XFERREADY and MBF_SMOKE_EXPECT_CLOSEDSREQ cannot both be set\n");
+        ++failures;
+    }
+
+    if ((hasExpectedImageXResolution && expectedImageXResolution <= 0) ||
+        (hasExpectedImageYResolution && expectedImageYResolution <= 0))
+    {
+        std::printf("MBF_SMOKE_EXPECT_XRESOLUTION and MBF_SMOKE_EXPECT_YRESOLUTION must be positive\n");
         ++failures;
     }
 
@@ -962,6 +1025,28 @@ int wmain(int argc, wchar_t** argv)
                             static_cast<long>(imageInfo.ImageLength));
                         ++failures;
                     }
+                    if (hasExpectedImageXResolution &&
+                        (imageInfo.XResolution.Whole != expectedImageXResolution || imageInfo.XResolution.Frac != 0))
+                    {
+                        std::printf(
+                            "%s: expected XResolution %ld, got %d.%u\n",
+                            imageInfoLabel,
+                            expectedImageXResolution,
+                            imageInfo.XResolution.Whole,
+                            imageInfo.XResolution.Frac);
+                        ++failures;
+                    }
+                    if ((hasExpectedImageXResolution || hasExpectedImageYResolution) &&
+                        (imageInfo.YResolution.Whole != expectedImageYResolution || imageInfo.YResolution.Frac != 0))
+                    {
+                        std::printf(
+                            "%s: expected YResolution %ld, got %d.%u\n",
+                            imageInfoLabel,
+                            expectedImageYResolution,
+                            imageInfo.YResolution.Whole,
+                            imageInfo.YResolution.Frac);
+                        ++failures;
+                    }
 
                     TW_HANDLE dib = nullptr;
                     const TW_UINT16 transferReturn =
@@ -988,6 +1073,26 @@ int wmain(int argc, wchar_t** argv)
                             transferredWidth = header->biWidth;
                             transferredHeight = header->biHeight;
                             transferredBitsPerPixel = header->biBitCount;
+                            if (hasExpectedImageXResolution &&
+                                header->biXPelsPerMeter != DpiToPixelsPerMeter(expectedImageXResolution))
+                            {
+                                std::printf(
+                                    "DAT_IMAGENATIVEXFER/MSG_GET #%u: expected biXPelsPerMeter %ld, got %ld\n",
+                                    static_cast<unsigned>(transferIndex + 1),
+                                    DpiToPixelsPerMeter(expectedImageXResolution),
+                                    static_cast<long>(header->biXPelsPerMeter));
+                                ++failures;
+                            }
+                            if ((hasExpectedImageXResolution || hasExpectedImageYResolution) &&
+                                header->biYPelsPerMeter != DpiToPixelsPerMeter(expectedImageYResolution))
+                            {
+                                std::printf(
+                                    "DAT_IMAGENATIVEXFER/MSG_GET #%u: expected biYPelsPerMeter %ld, got %ld\n",
+                                    static_cast<unsigned>(transferIndex + 1),
+                                    DpiToPixelsPerMeter(expectedImageYResolution),
+                                    static_cast<long>(header->biYPelsPerMeter));
+                                ++failures;
+                            }
                             std::printf(
                                 "DAT_IMAGENATIVEXFER/MSG_GET #%u: XFERDONE %ld x %ld %u bpp\n",
                                 static_cast<unsigned>(transferIndex + 1),

@@ -18,13 +18,11 @@
 #include <vector>
 
 #include "ImageDib.h"
+#include "ScannerIpcClient.h"
 #include "twain.h"
 
 namespace mbf::twain
 {
-
-struct ScannerIpcState;
-
 enum class TwainState : TW_UINT16
 {
     SourceLoaded = 3,
@@ -130,7 +128,7 @@ private:
     TW_UINT32 pendingTransferIndex_ = 0;
     bool hasCurrentTransferImage_ = false;
     TW_UINT32 currentTransferImageIndex_ = 0;
-    std::vector<std::wstring> pendingImages_;
+    std::vector<ScannerIpcImage> pendingImages_;
     MemoryTransferState memoryTransfer_{};
     TW_ENTRYPOINT entryPoint_{};
     std::optional<TW_IDENTITY> openOrigin_;

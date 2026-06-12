@@ -129,6 +129,27 @@ bool StartsWith(std::string_view text, std::string_view prefix) noexcept
            text.substr(0, prefix.size()) == prefix;
 }
 
+bool ParseImagePayload(std::string_view text, mbf::twain::ScannerIpcImage& image)
+{
+    const size_t separator = text.find('|');
+    if (separator != std::string_view::npos)
+    {
+        std::uint32_t rotationDegrees = 0;
+        const std::string_view rotationText = text.substr(0, separator);
+        const std::string_view pathText = text.substr(separator + 1U);
+        if (ParseUInt32(rotationText, rotationDegrees))
+        {
+            image.rotationDegrees = rotationDegrees % 360U;
+            image.path = Utf8ToWide(std::string(pathText));
+            return !image.path.empty();
+        }
+    }
+
+    image.rotationDegrees = 0;
+    image.path = Utf8ToWide(std::string(text));
+    return !image.path.empty();
+}
+
 bool ParseStateResponse(const std::string& response, mbf::twain::ScannerIpcState& state)
 {
     std::istringstream stream(response);
@@ -203,7 +224,11 @@ bool ParseStateResponse(const std::string& response, mbf::twain::ScannerIpcState
         }
         else if (StartsWith(line, kImage))
         {
-            parsed.selectedImages.push_back(Utf8ToWide(line.substr(kImage.size())));
+            mbf::twain::ScannerIpcImage image{};
+            if (ParseImagePayload(std::string_view(line).substr(kImage.size()), image))
+            {
+                parsed.selectedImages.push_back(std::move(image));
+            }
         }
     }
 

@@ -1318,9 +1318,13 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(TW_UINT16 message, T
 
     DecodedImageInfo decodedInfo{};
     const TW_UINT32 imageIndex = pendingTransferIndex_;
+    const ScannerIpcImage& selectedImage = pendingImages_[imageIndex];
     TW_HANDLE dib = ImageDib::BuildNativeDib(
-        pendingImages_[imageIndex],
+        selectedImage.path,
         settings_.pixelType,
+        Fix32WholeOrDefault(settings_.xResolution, 300),
+        Fix32WholeOrDefault(settings_.yResolution, 300),
+        selectedImage.rotationDegrees,
         decodedInfo);
     if (dib == nullptr)
     {
@@ -2377,8 +2381,9 @@ bool VirtualTwainDataSource::FillImageInfo(TW_UINT32 imageIndex, pTW_IMAGEINFO i
         return false;
     }
 
+    const ScannerIpcImage& selectedImage = pendingImages_[imageIndex];
     DecodedImageInfo decodedInfo{};
-    if (!ImageDib::Probe(pendingImages_[imageIndex], decodedInfo))
+    if (!ImageDib::Probe(selectedImage.path, decodedInfo, selectedImage.rotationDegrees))
     {
         return false;
     }
@@ -2431,10 +2436,12 @@ bool VirtualTwainDataSource::EnsureMemoryTransferReady()
 
     ResetMemoryTransfer();
     RasterImage raster{};
+    const ScannerIpcImage& selectedImage = pendingImages_[pendingTransferIndex_];
     if (!ImageDib::BuildRaster(
-            pendingImages_[pendingTransferIndex_],
+            selectedImage.path,
             settings_.pixelType,
-            raster))
+            raster,
+            selectedImage.rotationDegrees))
     {
         return false;
     }

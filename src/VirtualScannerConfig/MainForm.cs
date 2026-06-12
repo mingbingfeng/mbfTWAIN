@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Windows.Forms;
@@ -10,10 +12,19 @@ namespace MbfTwain.VirtualScannerConfig;
 
 public sealed class MainForm : Form
 {
+    private static readonly Color AppBackground = Color.FromArgb(244, 246, 239);
+    private static readonly Color SurfaceBackground = Color.FromArgb(255, 255, 252);
+    private static readonly Color AccentColor = Color.FromArgb(29, 111, 84);
+    private static readonly Color AccentSoft = Color.FromArgb(228, 242, 235);
+    private static readonly Color BorderColor = Color.FromArgb(210, 217, 206);
+    private static readonly Color MutedTextColor = Color.FromArgb(94, 104, 97);
+    private static readonly string[] PixelTypeOptions = ["BW", "GRAY", "RGB"];
+    private static readonly string[] PaperSizeOptions = ["A4", "A3"];
+    private static readonly int[] DpiOptions = [150, 200, 300, 600];
+
     private readonly object stateLock = new();
-    private readonly List<string> selectedImages = new();
+    private readonly List<ScannerImageSelection> selectedImages = [];
     private readonly ScannerPipeServer pipeServer;
-    private bool suppressControlStateUpdate;
 
     private uint revision;
     private bool scanRequested;
@@ -21,25 +32,28 @@ public sealed class MainForm : Form
     private string pixelType = "RGB";
     private string paperSize = "A4";
     private int scanDpi = 300;
+    private int selectedImageIndex = -1;
 
-    private readonly ListBox imageList = new();
-    private readonly CheckBox duplexCheckBox = new();
-    private readonly ComboBox pixelTypeComboBox = new();
-    private readonly ComboBox paperSizeComboBox = new();
-    private readonly ComboBox dpiComboBox = new();
+    private readonly FlowLayoutPanel thumbnailStrip = new();
+    private readonly LinkLabel clearImagesLink = new();
+    private readonly Label settingsSummaryLabel = new();
+    private readonly Button settingsButton = new();
     private readonly Label statusLabel = new();
+    private readonly ToolTip toolTip = new();
 
     public MainForm()
     {
         Text = "mbfTwain 虚拟扫描仪";
-        MinimumSize = new Size(760, 520);
+        Size = new Size(900, 600);
+        MinimumSize = new Size(820, 560);
         StartPosition = FormStartPosition.CenterScreen;
+        BackColor = AppBackground;
 
         pipeServer = new ScannerPipeServer(GetSnapshot, BeginScanSession, HideScanUi, AcknowledgeScan);
         BuildLayout();
-        UpdateStateFromControls(incrementRevision: false);
+        UpdateSettingsSummary();
         pipeServer.Start();
-        UpdateStatus();
+        RefreshQueueVisuals();
         DiagnosticsLog.Write("UI", "MainForm initialized");
     }
 
@@ -47,6 +61,11 @@ public sealed class MainForm : Form
     {
         if (disposing)
         {
+            foreach (Control control in thumbnailStrip.Controls)
+            {
+                DisposeControlImages(control);
+            }
+
             pipeServer.Dispose();
         }
 
@@ -58,118 +77,356 @@ public sealed class MainForm : Form
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 3,
+            ColumnCount = 1,
+            RowCount = 2,
             Padding = new Padding(12),
+            BackColor = AppBackground,
         };
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        imageList.Dock = DockStyle.Fill;
-        imageList.HorizontalScrollbar = true;
-        root.Controls.Add(imageList, 0, 0);
-
-        var settings = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 5,
-            Padding = new Padding(12, 0, 0, 0),
-        };
-        settings.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-
-        duplexCheckBox.Text = "双面扫描";
-        duplexCheckBox.AutoSize = true;
-        duplexCheckBox.CheckedChanged += (_, _) => UpdateStateFromControls(incrementRevision: true);
-        settings.Controls.Add(duplexCheckBox, 0, 0);
-        settings.SetColumnSpan(duplexCheckBox, 2);
-
-        pixelTypeComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
-        pixelTypeComboBox.Items.AddRange(new object[] { "BW", "GRAY", "RGB" });
-        pixelTypeComboBox.SelectedItem = "RGB";
-        pixelTypeComboBox.SelectedIndexChanged += (_, _) => UpdateStateFromControls(incrementRevision: true);
-        AddLabeledControl(settings, "像素类型", pixelTypeComboBox, row: 1);
-
-        paperSizeComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
-        paperSizeComboBox.Items.AddRange(new object[] { "A4", "A3" });
-        paperSizeComboBox.SelectedItem = "A4";
-        paperSizeComboBox.SelectedIndexChanged += (_, _) => UpdateStateFromControls(incrementRevision: true);
-        AddLabeledControl(settings, "纸张类型", paperSizeComboBox, row: 2);
-
-        ConfigureDpiInput(dpiComboBox);
-        dpiComboBox.SelectedItem = 300;
-        dpiComboBox.SelectedIndexChanged += (_, _) => UpdateStateFromControls(incrementRevision: true);
-        AddLabeledControl(settings, "DPI", dpiComboBox, row: 3);
-
-        var triggerButton = new Button
-        {
-            Text = "开始扫描",
-            Dock = DockStyle.Top,
-            Height = 36,
-        };
-        triggerButton.Click += (_, _) => TriggerScan();
-        settings.Controls.Add(triggerButton, 0, 4);
-        settings.SetColumnSpan(triggerButton, 2);
-
-        root.Controls.Add(settings, 1, 0);
-
-        var imageButtons = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight,
-            AutoSize = true,
-        };
-        imageButtons.Controls.Add(BuildButton("添加图片", AddImages));
-        imageButtons.Controls.Add(BuildButton("移除选中", RemoveSelectedImages));
-        imageButtons.Controls.Add(BuildButton("清空", ClearImages));
-        root.Controls.Add(imageButtons, 0, 1);
-
-        statusLabel.AutoSize = true;
-        statusLabel.Dock = DockStyle.Fill;
-        root.Controls.Add(statusLabel, 0, 2);
-        root.SetColumnSpan(statusLabel, 2);
+        root.Controls.Add(BuildQueueSurface(), 0, 0);
+        root.Controls.Add(BuildFooterSurface(), 0, 1);
 
         Controls.Add(root);
     }
 
-    private static void AddLabeledControl(TableLayoutPanel panel, string labelText, Control control, int row)
+    private Control BuildFooterSurface()
     {
-        var label = new Label
+        var footer = new TableLayoutPanel
         {
-            Text = labelText,
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            AutoSize = true,
+            BackColor = AppBackground,
+            Margin = new Padding(0, 8, 0, 0),
+        };
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        footer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        statusLabel.AutoSize = true;
+        statusLabel.Anchor = AnchorStyles.Left;
+        statusLabel.ForeColor = MutedTextColor;
+        statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        statusLabel.Margin = new Padding(2, 0, 12, 0);
+        footer.Controls.Add(statusLabel, 0, 0);
+
+        footer.Controls.Add(BuildSettingsSurface(), 1, 0);
+        return footer;
+    }
+
+    private Control BuildSettingsSurface()
+    {
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Padding = new Padding(10, 8, 10, 8),
+            Margin = new Padding(0),
+            AutoSize = true,
+            BackColor = Color.FromArgb(247, 249, 245),
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.Paint += (_, args) =>
+        {
+            using var pen = new Pen(BorderColor);
+            var bounds = Rectangle.Inflate(layout.ClientRectangle, -1, -1);
+            args.Graphics.DrawRectangle(pen, bounds);
+        };
+
+        settingsSummaryLabel.AutoSize = true;
+        settingsSummaryLabel.Anchor = AnchorStyles.Left;
+        settingsSummaryLabel.ForeColor = MutedTextColor;
+        settingsSummaryLabel.Margin = new Padding(0, 0, 8, 0);
+        layout.Controls.Add(settingsSummaryLabel, 0, 0);
+
+        settingsButton.Width = 30;
+        settingsButton.Height = 26;
+        settingsButton.Text = "⚙";
+        settingsButton.FlatStyle = FlatStyle.Flat;
+        settingsButton.BackColor = layout.BackColor;
+        settingsButton.ForeColor = Color.FromArgb(49, 58, 52);
+        settingsButton.Anchor = AnchorStyles.None;
+        settingsButton.Margin = new Padding(0);
+        settingsButton.FlatAppearance.BorderColor = BorderColor;
+        settingsButton.Click += (_, _) => ShowSettingsDialog();
+        toolTip.SetToolTip(settingsButton, "扫描设置");
+        layout.Controls.Add(settingsButton, 1, 0);
+
+        UpdateSettingsSummary();
+        return layout;
+    }
+
+    private Control BuildQueueSurface()
+    {
+        var queueCard = BuildSurfacePanel();
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(18, 16, 18, 16),
+            BackColor = SurfaceBackground,
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Controls.Add(BuildQueueHeader(), 0, 0);
+
+        thumbnailStrip.Dock = DockStyle.Fill;
+        thumbnailStrip.AutoScroll = true;
+        thumbnailStrip.WrapContents = true;
+        thumbnailStrip.FlowDirection = FlowDirection.LeftToRight;
+        thumbnailStrip.Margin = new Padding(0, 18, 0, 0);
+        thumbnailStrip.Padding = new Padding(0, 0, 4, 4);
+        thumbnailStrip.BackColor = SurfaceBackground;
+        layout.Controls.Add(thumbnailStrip, 0, 1);
+
+        queueCard.Controls.Add(layout);
+        return queueCard;
+    }
+
+    private Control BuildQueueHeader()
+    {
+        var header = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 3,
+            RowCount = 2,
+            AutoSize = true,
+            BackColor = SurfaceBackground,
+            Margin = new Padding(0),
+        };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        header.Controls.Add(
+            new Label
+            {
+                AutoSize = true,
+                Text = "待扫描图片",
+                Font = new Font(Control.DefaultFont, FontStyle.Bold),
+                ForeColor = Color.FromArgb(33, 43, 37),
+                Margin = new Padding(0, 0, 12, 0),
+            },
+            0,
+            0);
+
+        ConfigureClearImagesLink();
+        header.Controls.Add(clearImagesLink, 1, 0);
+
+        var triggerButton = new Button
+        {
+            Text = "开始扫描",
+            Width = 112,
+            Height = 46,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = AccentColor,
+            ForeColor = Color.White,
+            Font = new Font(Font, FontStyle.Bold),
+            Margin = new Padding(12, 0, 0, 0),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+        };
+        triggerButton.FlatAppearance.BorderSize = 0;
+        triggerButton.Click += (_, _) => TriggerScan();
+        header.Controls.Add(triggerButton, 2, 0);
+        header.SetRowSpan(triggerButton, 2);
+
+        var subtitle = new Label
+        {
+            AutoSize = true,
+            Text = "用缩略图两侧箭头调整顺序，列表顺序就是扫描传输顺序。",
+            ForeColor = MutedTextColor,
+            Margin = new Padding(0, 6, 0, 0),
+        };
+        header.Controls.Add(subtitle, 0, 1);
+        header.SetColumnSpan(subtitle, 2);
+
+        return header;
+    }
+
+    private static Panel BuildSurfacePanel()
+    {
+        var panel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = SurfaceBackground,
+        };
+        panel.Paint += (_, args) =>
+        {
+            using var pen = new Pen(BorderColor);
+            var bounds = Rectangle.Inflate(panel.ClientRectangle, -1, -1);
+            args.Graphics.DrawRectangle(pen, bounds);
+        };
+        return panel;
+    }
+
+    private void UpdateSettingsSummary()
+    {
+        settingsSummaryLabel.Text = $"{pixelType} · {paperSize} · {scanDpi} DPI · {(duplexEnabled ? "双面" : "单面")}";
+    }
+
+    private void ConfigureClearImagesLink()
+    {
+        clearImagesLink.AutoSize = true;
+        clearImagesLink.Text = "清空队列";
+        clearImagesLink.LinkColor = Color.FromArgb(38, 100, 171);
+        clearImagesLink.ActiveLinkColor = Color.FromArgb(24, 75, 132);
+        clearImagesLink.VisitedLinkColor = clearImagesLink.LinkColor;
+        clearImagesLink.Margin = new Padding(0, 2, 0, 0);
+        clearImagesLink.LinkBehavior = LinkBehavior.AlwaysUnderline;
+        clearImagesLink.LinkClicked += (_, _) => ClearImages();
+    }
+
+    private void ShowSettingsDialog()
+    {
+        bool currentDuplex;
+        string currentPixelType;
+        string currentPaperSize;
+        int currentDpi;
+        lock (stateLock)
+        {
+            currentDuplex = duplexEnabled;
+            currentPixelType = pixelType;
+            currentPaperSize = paperSize;
+            currentDpi = scanDpi;
+        }
+
+        using var dialog = new Form
+        {
+            Text = "扫描设置",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            ClientSize = new Size(280, 230),
+            BackColor = SurfaceBackground,
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 5,
+            Padding = new Padding(16),
+            BackColor = SurfaceBackground,
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int row = 0; row < 4; row++)
+        {
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        }
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var pixelInput = BuildSettingsCombo(PixelTypeOptions.Cast<object>().ToArray(), currentPixelType);
+        var paperInput = BuildSettingsCombo(PaperSizeOptions.Cast<object>().ToArray(), currentPaperSize);
+        var dpiInput = BuildSettingsCombo(DpiOptions.Cast<object>().ToArray(), currentDpi);
+        var duplexInput = new CheckBox
+        {
+            Text = "双面",
+            Checked = currentDuplex,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
-            Padding = new Padding(0, 6, 8, 0),
+            Margin = new Padding(0, 6, 0, 8),
         };
-        control.Dock = DockStyle.Top;
-        panel.Controls.Add(label, 0, row);
-        panel.Controls.Add(control, 1, row);
-    }
 
-    private static void ConfigureDpiInput(ComboBox input)
-    {
-        input.DropDownStyle = ComboBoxStyle.DropDownList;
-        input.Items.AddRange(new object[] { 150, 200, 300, 600 });
-    }
+        AddSettingsDialogRow(layout, "像素", pixelInput, 0);
+        AddSettingsDialogRow(layout, "纸张", paperInput, 1);
+        AddSettingsDialogRow(layout, "DPI", dpiInput, 2);
+        layout.Controls.Add(new Label { AutoSize = true, Text = string.Empty, Margin = new Padding(0) }, 0, 3);
+        layout.Controls.Add(duplexInput, 1, 3);
 
-    private static Button BuildButton(string text, Action action)
-    {
-        var button = new Button
+        var buttons = new FlowLayoutPanel
         {
-            Text = text,
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
             AutoSize = true,
-            Height = 32,
-            Margin = new Padding(0, 0, 8, 0),
+            Margin = new Padding(0, 12, 0, 0),
         };
-        button.Click += (_, _) => action();
-        return button;
+        var okButton = new Button { Text = "确定", DialogResult = DialogResult.OK, Width = 76 };
+        var cancelButton = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Width = 76 };
+        buttons.Controls.Add(okButton);
+        buttons.Controls.Add(cancelButton);
+        layout.Controls.Add(buttons, 0, 4);
+        layout.SetColumnSpan(buttons, 2);
+
+        dialog.AcceptButton = okButton;
+        dialog.CancelButton = cancelButton;
+        dialog.Controls.Add(layout);
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        ApplySettingsFromDialog(
+            duplexInput.Checked,
+            pixelInput.SelectedItem?.ToString() ?? "RGB",
+            paperInput.SelectedItem?.ToString() ?? "A4",
+            Convert.ToInt32(dpiInput.SelectedItem ?? 300));
     }
 
-    private void AddImages()
+    private static ComboBox BuildSettingsCombo(object[] items, object selected)
+    {
+        var input = new ComboBox
+        {
+            Dock = DockStyle.Top,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Margin = new Padding(0, 0, 0, 8),
+        };
+        input.Items.AddRange(items);
+        input.SelectedItem = selected;
+        if (input.SelectedIndex < 0 && input.Items.Count > 0)
+        {
+            input.SelectedIndex = 0;
+        }
+
+        return input;
+    }
+
+    private static void AddSettingsDialogRow(TableLayoutPanel layout, string labelText, Control control, int row)
+    {
+        layout.Controls.Add(
+            new Label
+            {
+                AutoSize = true,
+                Text = labelText,
+                Anchor = AnchorStyles.Left,
+                ForeColor = Color.FromArgb(49, 58, 52),
+                Margin = new Padding(0, 4, 8, 8),
+            },
+            0,
+            row);
+        layout.Controls.Add(control, 1, row);
+    }
+
+    private void ApplySettingsFromDialog(bool duplex, string selectedPixelType, string selectedPaperSize, int selectedDpi)
+    {
+        lock (stateLock)
+        {
+            duplexEnabled = duplex;
+            pixelType = PixelTypeOptions.Contains(selectedPixelType) ? selectedPixelType : "RGB";
+            paperSize = PaperSizeOptions.Contains(selectedPaperSize) ? selectedPaperSize : "A4";
+            scanDpi = DpiOptions.Contains(selectedDpi) ? selectedDpi : 300;
+            revision++;
+        }
+
+        UpdateSettingsSummary();
+        UpdateStatus();
+    }
+
+    private bool AddImages()
     {
         using var dialog = new OpenFileDialog
         {
@@ -180,46 +437,85 @@ public sealed class MainForm : Form
 
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
-            return;
+            return false;
         }
 
+        int firstAddedIndex = -1;
+        int addedCount = 0;
         lock (stateLock)
         {
-            foreach (string fileName in dialog.FileNames.Where(File.Exists))
+            foreach (string fileName in dialog.FileNames.Select(Path.GetFullPath).Where(File.Exists))
             {
-                if (!selectedImages.Contains(fileName, StringComparer.OrdinalIgnoreCase))
+                if (selectedImages.Any(existing => string.Equals(existing.Path, fileName, StringComparison.OrdinalIgnoreCase)))
                 {
-                    selectedImages.Add(fileName);
+                    continue;
+                }
+
+                selectedImages.Add(new ScannerImageSelection(fileName, 0));
+                addedCount++;
+                if (firstAddedIndex < 0)
+                {
+                    firstAddedIndex = selectedImages.Count - 1;
                 }
             }
 
-            revision++;
+            if (addedCount > 0)
+            {
+                if (selectedImageIndex < 0)
+                {
+                    selectedImageIndex = firstAddedIndex;
+                }
+
+                revision++;
+            }
         }
 
-        RefreshImageList();
-        UpdateStatus();
+        if (addedCount == 0)
+        {
+            return false;
+        }
+
+        RefreshQueueVisuals();
+        return true;
     }
 
-    private void RemoveSelectedImages()
+    private void RemoveImage(int index)
     {
-        var selected = imageList.SelectedItems.Cast<string>().ToList();
-        if (selected.Count == 0)
-        {
-            return;
-        }
-
+        bool removed = false;
         lock (stateLock)
         {
-            foreach (string item in selected)
+            if (index < 0 || index >= selectedImages.Count)
             {
-                selectedImages.Remove(item);
+                return;
+            }
+
+            selectedImages.RemoveAt(index);
+            if (selectedImages.Count == 0)
+            {
+                selectedImageIndex = -1;
+                scanRequested = false;
+            }
+            else if (selectedImageIndex == index)
+            {
+                selectedImageIndex = Math.Min(index, selectedImages.Count - 1);
+            }
+            else if (selectedImageIndex > index)
+            {
+                selectedImageIndex--;
+            }
+            else if (selectedImageIndex >= selectedImages.Count)
+            {
+                selectedImageIndex = selectedImages.Count - 1;
             }
 
             revision++;
+            removed = true;
         }
 
-        RefreshImageList();
-        UpdateStatus();
+        if (removed)
+        {
+            RefreshQueueVisuals();
+        }
     }
 
     private void ClearImages()
@@ -227,60 +523,88 @@ public sealed class MainForm : Form
         lock (stateLock)
         {
             selectedImages.Clear();
+            selectedImageIndex = -1;
             scanRequested = false;
             revision++;
         }
 
-        RefreshImageList();
-        UpdateStatus();
+        RefreshQueueVisuals();
+    }
+
+    private void MoveImage(int index, int direction)
+    {
+        bool moved = false;
+        lock (stateLock)
+        {
+            int targetIndex = index + direction;
+            if (index < 0 ||
+                index >= selectedImages.Count ||
+                targetIndex < 0 ||
+                targetIndex >= selectedImages.Count)
+            {
+                return;
+            }
+
+            (selectedImages[index], selectedImages[targetIndex]) =
+                (selectedImages[targetIndex], selectedImages[index]);
+            selectedImageIndex = targetIndex;
+            revision++;
+            moved = true;
+        }
+
+        if (moved)
+        {
+            RefreshQueueVisuals();
+        }
+    }
+
+    private void RotateImage(int index, int deltaDegrees)
+    {
+        bool rotated = false;
+        lock (stateLock)
+        {
+            if (index < 0 || index >= selectedImages.Count)
+            {
+                return;
+            }
+
+            ScannerImageSelection current = selectedImages[index];
+            int updatedRotation = NormalizeRotationDegrees(current.RotationDegrees + deltaDegrees);
+            selectedImages[index] = current with { RotationDegrees = updatedRotation };
+            selectedImageIndex = index;
+            revision++;
+            rotated = true;
+        }
+
+        if (rotated)
+        {
+            RefreshQueueVisuals();
+        }
     }
 
     private void TriggerScan()
     {
+        bool hasImages;
         lock (stateLock)
         {
-            if (selectedImages.Count > 0)
-            {
-                scanRequested = true;
-                revision++;
-                UpdateStatus();
-                return;
-            }
+            hasImages = selectedImages.Count > 0;
         }
 
-        AddImages();
-
-        lock (stateLock)
-        {
-            scanRequested = selectedImages.Count > 0;
-            if (scanRequested)
-            {
-                revision++;
-            }
-        }
-
-        UpdateStatus();
-    }
-
-    private void UpdateStateFromControls(bool incrementRevision)
-    {
-        if (suppressControlStateUpdate)
+        if (!hasImages && !AddImages())
         {
             return;
         }
 
         lock (stateLock)
         {
-            duplexEnabled = duplexCheckBox.Checked;
-            pixelType = pixelTypeComboBox.SelectedItem?.ToString() ?? "RGB";
-            paperSize = paperSizeComboBox.SelectedItem?.ToString() ?? "A4";
-            scanDpi = Convert.ToInt32(dpiComboBox.SelectedItem ?? 300);
-            if (incrementRevision)
+            if (selectedImages.Count > 0)
             {
+                scanRequested = true;
                 revision++;
             }
         }
 
+        UpdateSettingsSummary();
         UpdateStatus();
     }
 
@@ -320,12 +644,13 @@ public sealed class MainForm : Form
                 }
 
                 selectedImages.Clear();
+                selectedImageIndex = -1;
                 scanRequested = false;
                 revision++;
             }
 
             DiagnosticsLog.Write("UI", $"BeginScanSession.Apply revision={revision}");
-            RefreshImageList();
+            RefreshQueueVisuals();
             if (WindowState == FormWindowState.Minimized)
             {
                 WindowState = FormWindowState.Normal;
@@ -333,7 +658,6 @@ public sealed class MainForm : Form
 
             Show();
             Activate();
-            UpdateStatus();
             DiagnosticsLog.Write("UI", "BeginScanSession.Apply completed and window activated");
         }
 
@@ -351,33 +675,22 @@ public sealed class MainForm : Form
     {
         duplexEnabled = settings.DuplexEnabled;
 
-        if (pixelTypeComboBox.Items.Contains(settings.PixelType))
+        if (PixelTypeOptions.Contains(settings.PixelType))
         {
             pixelType = settings.PixelType;
         }
 
-        if (paperSizeComboBox.Items.Contains(settings.PaperSize))
+        if (PaperSizeOptions.Contains(settings.PaperSize))
         {
             paperSize = settings.PaperSize;
         }
 
-        if (dpiComboBox.Items.Contains(settings.XResolution))
+        if (DpiOptions.Contains(settings.XResolution))
         {
             scanDpi = settings.XResolution;
         }
 
-        suppressControlStateUpdate = true;
-        try
-        {
-            duplexCheckBox.Checked = duplexEnabled;
-            pixelTypeComboBox.SelectedItem = pixelType;
-            paperSizeComboBox.SelectedItem = paperSize;
-            dpiComboBox.SelectedItem = scanDpi;
-        }
-        finally
-        {
-            suppressControlStateUpdate = false;
-        }
+        UpdateSettingsSummary();
     }
 
     private void AcknowledgeScan(uint acknowledgedRevision)
@@ -390,6 +703,7 @@ public sealed class MainForm : Form
             {
                 scanRequested = false;
                 selectedImages.Clear();
+                selectedImageIndex = -1;
                 revision++;
                 acknowledged = true;
             }
@@ -403,8 +717,7 @@ public sealed class MainForm : Form
 
         BeginInvoke((MethodInvoker)(() =>
         {
-            RefreshImageList();
-            UpdateStatus();
+            RefreshQueueVisuals();
             Hide();
             DiagnosticsLog.Write("UI", "AcknowledgeScan applied and window hidden");
         }));
@@ -432,26 +745,487 @@ public sealed class MainForm : Form
         }));
     }
 
-    private void RefreshImageList()
+    private void RefreshQueueVisuals()
     {
-        imageList.BeginUpdate();
-        imageList.Items.Clear();
+        NormalizeSelection();
+        RefreshThumbnailStrip();
+        UpdateStatus();
+    }
+
+    private void NormalizeSelection()
+    {
         lock (stateLock)
         {
-            foreach (string image in selectedImages)
+            if (selectedImages.Count == 0)
             {
-                imageList.Items.Add(image);
+                selectedImageIndex = -1;
+            }
+            else if (selectedImageIndex < 0 || selectedImageIndex >= selectedImages.Count)
+            {
+                selectedImageIndex = 0;
+            }
+        }
+    }
+
+    private void RefreshThumbnailStrip()
+    {
+        List<ScannerImageSelection> snapshot;
+        int activeIndex;
+        lock (stateLock)
+        {
+            snapshot = [.. selectedImages];
+            activeIndex = selectedImageIndex;
+        }
+
+        thumbnailStrip.SuspendLayout();
+        foreach (Control control in thumbnailStrip.Controls)
+        {
+            DisposeControlImages(control);
+        }
+
+        thumbnailStrip.Controls.Clear();
+        for (int index = 0; index < snapshot.Count; index++)
+        {
+            thumbnailStrip.Controls.Add(BuildThumbnailTile(snapshot[index], index, index == activeIndex));
+        }
+
+        thumbnailStrip.Controls.Add(BuildAddTileButton());
+        thumbnailStrip.ResumeLayout();
+    }
+
+    private Button BuildAddTileButton()
+    {
+        var button = new Button
+        {
+            Width = 176,
+            Height = 170,
+            Margin = new Padding(0, 0, 14, 16),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(251, 252, 248),
+            ForeColor = AccentColor,
+            Font = new Font(Font.FontFamily, 14F, FontStyle.Regular),
+            Text = "+\r\n添加图片",
+            TextAlign = ContentAlignment.MiddleCenter,
+        };
+        button.FlatAppearance.BorderColor = BorderColor;
+        button.FlatAppearance.BorderSize = 1;
+        button.Click += (_, _) => AddImages();
+        return button;
+    }
+
+    private Control BuildThumbnailTile(ScannerImageSelection image, int index, bool isSelected)
+    {
+        var tile = new Panel
+        {
+            Width = 190,
+            Height = 190,
+            Margin = new Padding(0, 0, 14, 16),
+            Padding = new Padding(8),
+            BackColor = isSelected ? AccentSoft : Color.White,
+            Cursor = Cursors.Hand,
+            Tag = index,
+        };
+        tile.DoubleClick += (_, _) => ShowFullscreenPreview(index);
+        tile.Paint += (_, args) => DrawThumbnailBorder(
+            args.Graphics,
+            tile.ClientRectangle,
+            tile.BackColor.ToArgb() == AccentSoft.ToArgb());
+
+        var thumbnail = new PictureBox
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0),
+            SizeMode = PictureBoxSizeMode.Zoom,
+            BackColor = Color.FromArgb(248, 249, 244),
+            Cursor = Cursors.Hand,
+        };
+        thumbnail.Image = TryCreateThumbnail(image, new Size(172, 172));
+        thumbnail.DoubleClick += (_, _) => ShowFullscreenPreview(index);
+        tile.Controls.Add(thumbnail);
+
+        if (isSelected)
+        {
+            AddThumbnailActionControls(tile, index);
+        }
+
+        tile.Click += (_, _) => SelectImage(index);
+        thumbnail.Click += (_, _) => SelectImage(index);
+        return tile;
+    }
+
+    private void AddThumbnailActionControls(Panel tile, int index)
+    {
+        RemoveThumbnailActionControls(tile);
+        int totalCount;
+        lock (stateLock)
+        {
+            totalCount = selectedImages.Count;
+        }
+
+        const int edgeInset = 12;
+        const int verticalInset = 12;
+
+        var moveLeft = BuildMoveButton("‹", index, -1, enabled: index > 0);
+        moveLeft.Location = new Point(edgeInset, 72);
+        tile.Controls.Add(moveLeft);
+        moveLeft.BringToFront();
+
+        var moveRight = BuildMoveButton("›", index, 1, enabled: index < totalCount - 1);
+        moveRight.Location = new Point(tile.Width - moveRight.Width - edgeInset, 72);
+        tile.Controls.Add(moveRight);
+        moveRight.BringToFront();
+
+        var rotateLeft = BuildTileActionButton("↶", "左转 90°", index, () => RotateImage(index, -90));
+        rotateLeft.Location = new Point(edgeInset, tile.Height - rotateLeft.Height - verticalInset);
+        tile.Controls.Add(rotateLeft);
+        rotateLeft.BringToFront();
+
+        var rotateRight = BuildTileActionButton("↷", "右转 90°", index, () => RotateImage(index, 90));
+        rotateRight.Location = new Point(tile.Width - rotateRight.Width - edgeInset, tile.Height - rotateRight.Height - verticalInset);
+        tile.Controls.Add(rotateRight);
+        rotateRight.BringToFront();
+
+        var deleteButton = BuildTileActionButton("×", "删除", index, () => RemoveImage(index), isDanger: true);
+        deleteButton.Location = new Point(tile.Width - deleteButton.Width - 10, 12);
+        tile.Controls.Add(deleteButton);
+        deleteButton.BringToFront();
+    }
+
+    private static void RemoveThumbnailActionControls(Panel tile)
+    {
+        foreach (Control control in tile.Controls.Cast<Control>().Where(control => control is not PictureBox).ToArray())
+        {
+            tile.Controls.Remove(control);
+            control.Dispose();
+        }
+    }
+
+    private Button BuildMoveButton(string text, int index, int direction, bool enabled)
+    {
+        var button = new Button
+        {
+            Width = 28,
+            Height = 42,
+            Text = text,
+            Enabled = enabled,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(238, 245, 240),
+            ForeColor = Color.FromArgb(35, 57, 49),
+            Font = new Font(Font.FontFamily, 18F, FontStyle.Bold),
+            Padding = new Padding(0),
+            Margin = new Padding(0),
+            Cursor = Cursors.Hand,
+            TabStop = false,
+        };
+        button.FlatAppearance.BorderColor = BorderColor;
+        button.FlatAppearance.BorderSize = 1;
+        button.Click += (_, _) => MoveImage(index, direction);
+        return button;
+    }
+
+    private Button BuildTileActionButton(string text, string tooltip, int index, Action action, bool isDanger = false)
+    {
+        var button = new Button
+        {
+            Width = 34,
+            Height = 30,
+            Text = isDanger ? string.Empty : text,
+            TextAlign = ContentAlignment.MiddleCenter,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = isDanger ? Color.FromArgb(255, 246, 242) : Color.FromArgb(238, 245, 240),
+            ForeColor = isDanger ? Color.FromArgb(151, 68, 49) : Color.FromArgb(35, 57, 49),
+            Font = new Font(Font.FontFamily, 14F, FontStyle.Bold),
+            Padding = new Padding(0),
+            Margin = new Padding(0),
+            Cursor = Cursors.Hand,
+            TabStop = false,
+            Tag = index,
+        };
+        button.FlatAppearance.BorderColor = isDanger ? Color.FromArgb(231, 199, 186) : BorderColor;
+        button.FlatAppearance.BorderSize = 1;
+        if (isDanger)
+        {
+            button.Paint += (_, args) => TextRenderer.DrawText(
+                args.Graphics,
+                text,
+                button.Font,
+                button.ClientRectangle,
+                button.ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        }
+
+        button.Click += (_, _) => action();
+        toolTip.SetToolTip(button, tooltip);
+        return button;
+    }
+
+    private static void DrawThumbnailBorder(Graphics graphics, Rectangle bounds, bool isSelected)
+    {
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using var pen = new Pen(isSelected ? AccentColor : BorderColor, isSelected ? 2F : 1F);
+        var border = Rectangle.Inflate(bounds, -1, -1);
+        graphics.DrawRectangle(pen, border);
+    }
+
+    private void SelectImage(int index)
+    {
+        int previousIndex;
+        bool changed = false;
+        lock (stateLock)
+        {
+            previousIndex = selectedImageIndex;
+            if (index >= 0 && index < selectedImages.Count && selectedImageIndex != index)
+            {
+                selectedImageIndex = index;
+                changed = true;
             }
         }
 
-        imageList.EndUpdate();
+        if (changed)
+        {
+            UpdateThumbnailSelection(previousIndex, isSelected: false);
+            UpdateThumbnailSelection(index, isSelected: true);
+            UpdateStatus();
+        }
+    }
+
+    private void UpdateThumbnailSelection(int index, bool isSelected)
+    {
+        if (index < 0 || index >= thumbnailStrip.Controls.Count)
+        {
+            return;
+        }
+
+        if (thumbnailStrip.Controls[index] is not Panel tile)
+        {
+            return;
+        }
+
+        tile.SuspendLayout();
+        tile.BackColor = isSelected ? AccentSoft : Color.White;
+        if (isSelected)
+        {
+            AddThumbnailActionControls(tile, index);
+        }
+        else
+        {
+            RemoveThumbnailActionControls(tile);
+        }
+
+        tile.ResumeLayout();
+        tile.Invalidate();
+    }
+
+    private void ShowFullscreenPreview(int index)
+    {
+        ScannerImageSelection? image;
+        int previousIndex;
+        bool changed;
+        lock (stateLock)
+        {
+            if (index < 0 || index >= selectedImages.Count)
+            {
+                return;
+            }
+
+            image = selectedImages[index];
+            previousIndex = selectedImageIndex;
+            selectedImageIndex = index;
+            changed = previousIndex != index;
+        }
+
+        if (changed)
+        {
+            UpdateThumbnailSelection(previousIndex, isSelected: false);
+            UpdateThumbnailSelection(index, isSelected: true);
+            UpdateStatus();
+        }
+
+        using Bitmap preview = LoadPreparedImage(image.Path, image.RotationDegrees);
+        using var dialog = new Form
+        {
+            Text = Path.GetFileName(image.Path),
+            WindowState = FormWindowState.Maximized,
+            StartPosition = FormStartPosition.CenterParent,
+            BackColor = Color.Black,
+            KeyPreview = true,
+        };
+        using var previewCopy = new Bitmap(preview);
+        var viewer = new PictureBox
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Color.Black,
+            SizeMode = PictureBoxSizeMode.Zoom,
+            Image = previewCopy,
+        };
+        dialog.Controls.Add(viewer);
+        dialog.KeyDown += (_, args) =>
+        {
+            if (args.KeyCode == Keys.Escape || args.KeyCode == Keys.Enter)
+            {
+                dialog.Close();
+            }
+        };
+        viewer.DoubleClick += (_, _) => dialog.Close();
+        dialog.ShowDialog(this);
+        viewer.Image = null;
     }
 
     private void UpdateStatus()
     {
         ScannerStateSnapshot snapshot = GetSnapshot();
+        int activePage;
+        lock (stateLock)
+        {
+            activePage = selectedImageIndex + 1;
+        }
+
         string scanState = snapshot.ScanRequested ? "等待 TWAIN 程序取图" : "等待选择图片";
+        string activeText = snapshot.SelectedImages.Count == 0 || activePage <= 0
+            ? "未选中页面"
+            : $"当前第 {activePage}/{snapshot.SelectedImages.Count} 页";
         statusLabel.Text =
-            $"{scanState} | 图片 {snapshot.SelectedImages.Count} | {snapshot.PixelType} | {snapshot.PaperSize} | {snapshot.XResolution}x{snapshot.YResolution} DPI | 管道 {ScannerPipeServer.PipeName}";
+            $"{scanState} | 队列 {snapshot.SelectedImages.Count} | {activeText} | {snapshot.PixelType} | {snapshot.PaperSize} | {snapshot.XResolution}x{snapshot.YResolution} DPI | 管道 {ScannerPipeServer.PipeName}";
+    }
+
+    private static int NormalizeRotationDegrees(int rotationDegrees)
+    {
+        int normalized = rotationDegrees % 360;
+        return normalized < 0 ? normalized + 360 : normalized;
+    }
+
+    private static void DisposeControlImages(Control control)
+    {
+        foreach (Control child in control.Controls)
+        {
+            DisposeControlImages(child);
+        }
+
+        if (control is PictureBox pictureBox)
+        {
+            DisposePictureBoxImage(pictureBox);
+        }
+    }
+
+    private static void DisposePictureBoxImage(PictureBox pictureBox)
+    {
+        Image? image = pictureBox.Image;
+        pictureBox.Image = null;
+        image?.Dispose();
+    }
+
+    private static Image TryCreateThumbnail(ScannerImageSelection image, Size size)
+    {
+        try
+        {
+            using Bitmap bitmap = LoadPreparedImage(image.Path, image.RotationDegrees);
+            return RenderThumbnail(bitmap, size);
+        }
+        catch
+        {
+            return CreateFallbackThumbnail(size, "无法预览");
+        }
+    }
+
+    private static Bitmap LoadPreparedImage(string path, int rotationDegrees)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        using var memory = new MemoryStream(bytes);
+        using var source = Image.FromStream(memory, useEmbeddedColorManagement: true, validateImageData: true);
+        var bitmap = new Bitmap(source);
+        ApplyExifOrientation(bitmap);
+        ApplyRotation(bitmap, rotationDegrees);
+        return bitmap;
+    }
+
+    private static void ApplyExifOrientation(Image image)
+    {
+        const int ExifOrientationId = 0x0112;
+        if (!image.PropertyIdList.Contains(ExifOrientationId))
+        {
+            return;
+        }
+
+        try
+        {
+            PropertyItem? property = image.GetPropertyItem(ExifOrientationId);
+            if (property?.Value is null || property.Value.Length < 2)
+            {
+                return;
+            }
+
+            ushort orientation = BitConverter.ToUInt16(property.Value, 0);
+            image.RotateFlip(orientation switch
+            {
+                2 => RotateFlipType.RotateNoneFlipX,
+                3 => RotateFlipType.Rotate180FlipNone,
+                4 => RotateFlipType.Rotate180FlipX,
+                5 => RotateFlipType.Rotate90FlipX,
+                6 => RotateFlipType.Rotate90FlipNone,
+                7 => RotateFlipType.Rotate270FlipX,
+                8 => RotateFlipType.Rotate270FlipNone,
+                _ => RotateFlipType.RotateNoneFlipNone,
+            });
+        }
+        catch
+        {
+        }
+    }
+
+    private static void ApplyRotation(Image image, int rotationDegrees)
+    {
+        image.RotateFlip(NormalizeRotationDegrees(rotationDegrees) switch
+        {
+            90 => RotateFlipType.Rotate90FlipNone,
+            180 => RotateFlipType.Rotate180FlipNone,
+            270 => RotateFlipType.Rotate270FlipNone,
+            _ => RotateFlipType.RotateNoneFlipNone,
+        });
+    }
+
+    private static Bitmap RenderThumbnail(Image source, Size targetSize)
+    {
+        var thumbnail = new Bitmap(targetSize.Width, targetSize.Height);
+        using var graphics = Graphics.FromImage(thumbnail);
+        graphics.Clear(Color.FromArgb(247, 248, 242));
+        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.SmoothingMode = SmoothingMode.HighQuality;
+
+        Rectangle destination = FitWithin(source.Size, targetSize);
+        graphics.DrawImage(source, destination);
+        return thumbnail;
+    }
+
+    private static Bitmap CreateFallbackThumbnail(Size size, string text)
+    {
+        var thumbnail = new Bitmap(size.Width, size.Height);
+        using var graphics = Graphics.FromImage(thumbnail);
+        graphics.Clear(Color.FromArgb(245, 246, 240));
+        using var pen = new Pen(BorderColor);
+        graphics.DrawRectangle(pen, 0, 0, size.Width - 1, size.Height - 1);
+        TextRenderer.DrawText(
+            graphics,
+            text,
+            SystemFonts.MessageBoxFont,
+            new Rectangle(6, 6, size.Width - 12, size.Height - 12),
+            MutedTextColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
+        return thumbnail;
+    }
+
+    private static Rectangle FitWithin(Size source, Size target)
+    {
+        if (source.Width <= 0 || source.Height <= 0)
+        {
+            return new Rectangle(0, 0, target.Width, target.Height);
+        }
+
+        float ratio = Math.Min(target.Width / (float)source.Width, target.Height / (float)source.Height);
+        int width = Math.Max(1, (int)Math.Round(source.Width * ratio));
+        int height = Math.Max(1, (int)Math.Round(source.Height * ratio));
+        int left = (target.Width - width) / 2;
+        int top = (target.Height - height) / 2;
+        return new Rectangle(left, top, width, height);
     }
 }

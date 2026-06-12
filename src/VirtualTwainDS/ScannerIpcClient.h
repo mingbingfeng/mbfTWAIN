@@ -16,6 +16,12 @@
 namespace mbf::twain
 {
 
+struct ScannerIpcImage
+{
+    std::wstring path;
+    std::uint32_t rotationDegrees = 0;
+};
+
 struct ScannerIpcState
 {
     std::uint32_t revision = 0;
@@ -25,7 +31,7 @@ struct ScannerIpcState
     std::uint32_t xResolution = 300;
     std::uint32_t yResolution = 300;
     bool scanRequested = false;
-    std::vector<std::wstring> selectedImages;
+    std::vector<ScannerIpcImage> selectedImages;
 };
 
 class ScannerIpcClient final

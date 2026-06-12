@@ -165,6 +165,26 @@ bool ExifOrientationSwapsDimensions(UINT orientation) noexcept
     return orientation >= 5 && orientation <= 8;
 }
 
+UINT NormalizeRotationDegrees(std::uint32_t rotationDegrees) noexcept
+{
+    switch (rotationDegrees % 360U)
+    {
+    case 90U:
+        return 90U;
+    case 180U:
+        return 180U;
+    case 270U:
+        return 270U;
+    default:
+        return 0U;
+    }
+}
+
+bool RotationSwapsDimensions(UINT rotationDegrees) noexcept
+{
+    return rotationDegrees == 90U || rotationDegrees == 270U;
+}
+
 bool DecodeBgra(
     IWICImagingFactory* factory,
     IWICBitmapSource* source,
@@ -305,6 +325,104 @@ bool ApplyExifOrientationToBgra(
     height = destinationHeight;
     stride = destinationStride;
     return true;
+}
+
+void MapQuarterTurnRotatedPixel(
+    UINT rotationDegrees,
+    UINT destinationX,
+    UINT destinationY,
+    UINT sourceWidth,
+    UINT sourceHeight,
+    UINT& sourceX,
+    UINT& sourceY) noexcept
+{
+    switch (rotationDegrees)
+    {
+    case 90U:
+        sourceX = destinationY;
+        sourceY = sourceHeight - 1U - destinationX;
+        break;
+    case 180U:
+        sourceX = sourceWidth - 1U - destinationX;
+        sourceY = sourceHeight - 1U - destinationY;
+        break;
+    case 270U:
+        sourceX = sourceWidth - 1U - destinationY;
+        sourceY = destinationX;
+        break;
+    case 0U:
+    default:
+        sourceX = destinationX;
+        sourceY = destinationY;
+        break;
+    }
+}
+
+bool ApplyQuarterTurnRotationToBgra(
+    std::vector<BYTE>& pixels,
+    UINT& width,
+    UINT& height,
+    UINT& stride,
+    std::uint32_t rotationDegrees) noexcept
+{
+    const UINT normalizedRotation = NormalizeRotationDegrees(rotationDegrees);
+    if (normalizedRotation == 0U)
+    {
+        return true;
+    }
+
+    if (width == 0 || height == 0 || stride < width * 4U ||
+        pixels.size() < static_cast<size_t>(stride) * static_cast<size_t>(height))
+    {
+        return false;
+    }
+
+    const UINT sourceWidth = width;
+    const UINT sourceHeight = height;
+    const UINT sourceStride = stride;
+    const UINT destinationWidth = RotationSwapsDimensions(normalizedRotation) ? sourceHeight : sourceWidth;
+    const UINT destinationHeight = RotationSwapsDimensions(normalizedRotation) ? sourceWidth : sourceHeight;
+    const UINT destinationStride = destinationWidth * 4U;
+    std::vector<BYTE> rotated(
+        static_cast<size_t>(destinationStride) * static_cast<size_t>(destinationHeight));
+
+    for (UINT y = 0; y < destinationHeight; ++y)
+    {
+        BYTE* destinationRow = rotated.data() + (static_cast<size_t>(y) * destinationStride);
+        for (UINT x = 0; x < destinationWidth; ++x)
+        {
+            UINT sourceX = 0;
+            UINT sourceY = 0;
+            MapQuarterTurnRotatedPixel(
+                normalizedRotation,
+                x,
+                y,
+                sourceWidth,
+                sourceHeight,
+                sourceX,
+                sourceY);
+            const BYTE* sourcePixel = pixels.data() +
+                (static_cast<size_t>(sourceY) * sourceStride) +
+                (static_cast<size_t>(sourceX) * 4U);
+            std::memcpy(destinationRow + (static_cast<size_t>(x) * 4U), sourcePixel, 4U);
+        }
+    }
+
+    pixels.swap(rotated);
+    width = destinationWidth;
+    height = destinationHeight;
+    stride = destinationStride;
+    return true;
+}
+
+LONG DpiToPixelsPerMeter(std::uint32_t dpi) noexcept
+{
+    if (dpi == 0)
+    {
+        return 0;
+    }
+
+    return static_cast<LONG>((static_cast<std::uint64_t>(dpi) * 10000ULL + 127ULL) / 254ULL);
 }
 
 WORD BitsPerPixel(TW_UINT16 pixelType) noexcept
@@ -512,7 +630,10 @@ void FillBlackWhiteRaster(
 namespace mbf::twain
 {
 
-bool ImageDib::Probe(const std::wstring& path, DecodedImageInfo& info) noexcept
+bool ImageDib::Probe(
+    const std::wstring& path,
+    DecodedImageInfo& info,
+    std::uint32_t rotationDegrees) noexcept
 {
     const ComInitialization com;
     if (!com.Usable())
@@ -544,6 +665,11 @@ bool ImageDib::Probe(const std::wstring& path, DecodedImageInfo& info) noexcept
         std::swap(width, height);
     }
 
+    if (RotationSwapsDimensions(NormalizeRotationDegrees(rotationDegrees)))
+    {
+        std::swap(width, height);
+    }
+
     info.width = width;
     info.height = height;
     return true;
@@ -552,7 +678,8 @@ bool ImageDib::Probe(const std::wstring& path, DecodedImageInfo& info) noexcept
 bool ImageDib::BuildRaster(
     const std::wstring& path,
     TW_UINT16 pixelType,
-    RasterImage& image) noexcept
+    RasterImage& image,
+    std::uint32_t rotationDegrees) noexcept
 {
     const ComInitialization com;
     if (!com.Usable())
@@ -578,7 +705,8 @@ bool ImageDib::BuildRaster(
     UINT sourceStride = 0;
     const UINT orientation = ReadExifOrientation(frame.Get());
     if (!DecodeBgra(factory.Get(), frame.Get(), bgra, width, height, sourceStride) ||
-        !ApplyExifOrientationToBgra(bgra, width, height, sourceStride, orientation))
+        !ApplyExifOrientationToBgra(bgra, width, height, sourceStride, orientation) ||
+        !ApplyQuarterTurnRotationToBgra(bgra, width, height, sourceStride, rotationDegrees))
     {
         return false;
     }
@@ -611,6 +739,9 @@ bool ImageDib::BuildRaster(
 TW_HANDLE ImageDib::BuildNativeDib(
     const std::wstring& path,
     TW_UINT16 pixelType,
+    std::uint32_t xResolutionDpi,
+    std::uint32_t yResolutionDpi,
+    std::uint32_t rotationDegrees,
     DecodedImageInfo& info) noexcept
 {
     const ComInitialization com;
@@ -637,7 +768,8 @@ TW_HANDLE ImageDib::BuildNativeDib(
     UINT sourceStride = 0;
     const UINT orientation = ReadExifOrientation(frame.Get());
     if (!DecodeBgra(factory.Get(), frame.Get(), bgra, width, height, sourceStride) ||
-        !ApplyExifOrientationToBgra(bgra, width, height, sourceStride, orientation))
+        !ApplyExifOrientationToBgra(bgra, width, height, sourceStride, orientation) ||
+        !ApplyQuarterTurnRotationToBgra(bgra, width, height, sourceStride, rotationDegrees))
     {
         return nullptr;
     }
@@ -668,6 +800,8 @@ TW_HANDLE ImageDib::BuildNativeDib(
     header->biBitCount = bitsPerPixel;
     header->biCompression = BI_RGB;
     header->biSizeImage = static_cast<DWORD>(imageBytes);
+    header->biXPelsPerMeter = DpiToPixelsPerMeter(xResolutionDpi);
+    header->biYPelsPerMeter = DpiToPixelsPerMeter(yResolutionDpi);
     header->biClrUsed = static_cast<DWORD>(PaletteEntries(pixelType));
     header->biClrImportant = header->biClrUsed;
 

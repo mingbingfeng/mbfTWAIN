@@ -9,6 +9,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -35,14 +36,21 @@ struct RasterImage
 class ImageDib final
 {
 public:
-    static bool Probe(const std::wstring& path, DecodedImageInfo& info) noexcept;
+    static bool Probe(
+        const std::wstring& path,
+        DecodedImageInfo& info,
+        std::uint32_t rotationDegrees = 0) noexcept;
     static bool BuildRaster(
         const std::wstring& path,
         TW_UINT16 pixelType,
-        RasterImage& image) noexcept;
+        RasterImage& image,
+        std::uint32_t rotationDegrees = 0) noexcept;
     static TW_HANDLE BuildNativeDib(
         const std::wstring& path,
         TW_UINT16 pixelType,
+        std::uint32_t xResolutionDpi,
+        std::uint32_t yResolutionDpi,
+        std::uint32_t rotationDegrees,
         DecodedImageInfo& info) noexcept;
 };
 

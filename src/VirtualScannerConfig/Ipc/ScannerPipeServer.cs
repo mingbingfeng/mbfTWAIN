@@ -160,9 +160,11 @@ public sealed class ScannerPipeServer : IDisposable
         await writer.WriteLineAsync(FormattableString.Invariant($"xres {snapshot.XResolution}")).ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"yres {snapshot.YResolution}")).ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"scan {(snapshot.ScanRequested ? 1 : 0)}")).ConfigureAwait(false);
-        foreach (string image in snapshot.SelectedImages)
+        foreach (ScannerImageSelection image in snapshot.SelectedImages)
         {
-            await writer.WriteLineAsync($"image {image}").ConfigureAwait(false);
+            await writer
+                .WriteLineAsync(FormattableString.Invariant($"image {image.RotationDegrees}|{image.Path}"))
+                .ConfigureAwait(false);
         }
 
         await writer.WriteLineAsync("END").ConfigureAwait(false);
