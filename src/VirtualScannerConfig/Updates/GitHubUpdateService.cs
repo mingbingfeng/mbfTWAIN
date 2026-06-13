@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Text.Json;
@@ -19,6 +20,18 @@ internal sealed class GitHubUpdateService
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, LatestReleaseUri);
         using HttpResponseMessage response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(true);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            throw new InvalidOperationException(
+                "无法访问 GitHub Release。仓库为私有时，请设置 MBF_TWAIN_GITHUB_TOKEN 后再检查更新。");
+        }
+
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw new InvalidOperationException(
+                "GitHub 更新检查未授权或达到限额，请检查 MBF_TWAIN_GITHUB_TOKEN。");
+        }
+
         response.EnsureSuccessStatusCode();
 
         await using Stream contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(true);
@@ -114,7 +127,41 @@ internal sealed class GitHubUpdateService
         httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("mbfTwain.VirtualScannerConfig", "1.0"));
         httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
+
+        AuthenticationHeaderValue? authorization = GetGitHubAuthorizationHeader();
+        if (authorization is not null)
+        {
+            httpClient.DefaultRequestHeaders.Authorization = authorization;
+        }
+
         return httpClient;
+    }
+
+    private static AuthenticationHeaderValue? GetGitHubAuthorizationHeader()
+    {
+        string? token = Environment.GetEnvironmentVariable("MBF_TWAIN_GITHUB_TOKEN");
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            token = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        }
+
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return null;
+        }
+
+        token = token.Trim();
+        int separatorIndex = token.IndexOf(' ');
+        if (separatorIndex > 0)
+        {
+            string scheme = token[..separatorIndex];
+            string parameter = token[(separatorIndex + 1)..].Trim();
+            return string.IsNullOrWhiteSpace(parameter)
+                ? null
+                : new AuthenticationHeaderValue(scheme, parameter);
+        }
+
+        return new AuthenticationHeaderValue("Bearer", token);
     }
 
     private static Version GetCurrentVersion()

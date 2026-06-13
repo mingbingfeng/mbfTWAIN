@@ -18,3 +18,5 @@
 - `mbfTwain-Setup-v1.0.0.exe.sha256`
 
 安装器需要管理员权限，因为 TWAIN source 需要写入 Windows 的 TWAIN 目录。
+如果仓库保持私有，UI 更新检查需要在启动前设置可读取 release 的
+`MBF_TWAIN_GITHUB_TOKEN`；公开仓库不需要令牌。

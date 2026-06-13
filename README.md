@@ -135,3 +135,7 @@ The configuration UI checks `https://api.github.com/repos/mingbingfeng/mbfTWAIN/
 for the newest GitHub Release. The settings dialog contains a **检查更新** button
 that downloads the release installer asset matching `*Setup*.exe` to the user's
 temporary update directory, then starts it with UAC elevation.
+
+If the GitHub repository is private, set `MBF_TWAIN_GITHUB_TOKEN` to a token
+that can read the repository releases before launching the UI. Public releases
+do not require a token.
