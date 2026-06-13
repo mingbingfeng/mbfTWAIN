@@ -29,6 +29,7 @@ public sealed class MainForm : Form
     private readonly List<ScannerImageSelection> selectedImages = [];
     private readonly ScannerPipeServer pipeServer;
     private readonly GitHubUpdateService updateService = new();
+    private readonly CancellationTokenSource updateCancellation = new();
 
     private uint revision;
     private bool scanRequested;
@@ -59,7 +60,7 @@ public sealed class MainForm : Form
         UpdateSettingsSummary();
         pipeServer.Start();
         RefreshQueueVisuals();
-        _ = CheckForUpdatesSilentlyAsync();
+        Shown += (_, _) => StartSilentUpdateCheck();
         DiagnosticsLog.Write("UI", "MainForm initialized");
     }
 
@@ -67,12 +68,14 @@ public sealed class MainForm : Form
     {
         if (disposing)
         {
+            updateCancellation.Cancel();
             foreach (Control control in thumbnailStrip.Controls)
             {
                 DisposeControlImages(control);
             }
 
             pipeServer.Dispose();
+            updateCancellation.Dispose();
         }
 
         base.Dispose(disposing);
@@ -293,12 +296,22 @@ public sealed class MainForm : Form
         clearImagesLink.LinkClicked += (_, _) => ClearImages();
     }
 
-    private async Task CheckForUpdatesSilentlyAsync()
+    private void StartSilentUpdateCheck()
+    {
+        if (updateCancellation.IsCancellationRequested)
+        {
+            return;
+        }
+
+        _ = Task.Run(() => CheckForUpdatesSilentlyAsync(updateCancellation.Token), updateCancellation.Token);
+    }
+
+    private async Task CheckForUpdatesSilentlyAsync(CancellationToken cancellationToken)
     {
         try
         {
-            ReleaseUpdateInfo release = await updateService.GetLatestReleaseAsync(CancellationToken.None);
-            if (IsDisposed)
+            ReleaseUpdateInfo release = await updateService.GetLatestReleaseAsync(cancellationToken).ConfigureAwait(false);
+            if (cancellationToken.IsCancellationRequested || IsDisposed)
             {
                 return;
             }
@@ -312,7 +325,12 @@ public sealed class MainForm : Form
                 }
             }
 
-            if (InvokeRequired && IsHandleCreated)
+            if (!IsHandleCreated)
+            {
+                return;
+            }
+
+            if (InvokeRequired)
             {
                 BeginInvoke((MethodInvoker)Apply);
             }
@@ -320,6 +338,9 @@ public sealed class MainForm : Form
             {
                 Apply();
             }
+        }
+        catch (OperationCanceledException)
+        {
         }
         catch (Exception exception)
         {
@@ -492,7 +513,10 @@ public sealed class MainForm : Form
         try
         {
             updateStatus.Text = "正在检查 GitHub Releases...";
-            ReleaseUpdateInfo release = await updateService.GetLatestReleaseAsync(CancellationToken.None);
+            CancellationToken cancellationToken = updateCancellation.Token;
+            ReleaseUpdateInfo release = await Task
+                .Run(() => updateService.GetLatestReleaseAsync(cancellationToken), cancellationToken)
+                .ConfigureAwait(true);
             latestRelease = release;
             UpdateStatus();
 
@@ -530,10 +554,16 @@ public sealed class MainForm : Form
                     updateStatus.Text = $"正在下载 {progressValue.ToDisplayText()}";
                 }
             });
-            string installerPath = await updateService.DownloadInstallerAsync(release, progress, CancellationToken.None);
+            string installerPath = await Task
+                .Run(() => updateService.DownloadInstallerAsync(release, progress, cancellationToken), cancellationToken)
+                .ConfigureAwait(true);
             updateStatus.Text = "下载完成，正在启动安装程序...";
             LaunchInstallerElevated(installerPath);
             updateStatus.Text = "安装程序已启动，请按提示完成安装。";
+        }
+        catch (OperationCanceledException)
+        {
+            updateStatus.Text = "更新检查已取消。";
         }
         catch (Win32Exception exception) when (exception.NativeErrorCode == 1223)
         {

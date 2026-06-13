@@ -19,7 +19,7 @@ internal sealed class GitHubUpdateService
     public async Task<ReleaseUpdateInfo> GetLatestReleaseAsync(CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, LatestReleaseUri);
-        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(true);
+        using HttpResponseMessage response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
             throw new InvalidOperationException(
@@ -34,8 +34,8 @@ internal sealed class GitHubUpdateService
 
         response.EnsureSuccessStatusCode();
 
-        await using Stream contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(true);
-        using JsonDocument document = await JsonDocument.ParseAsync(contentStream, cancellationToken: cancellationToken).ConfigureAwait(true);
+        await using Stream contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using JsonDocument document = await JsonDocument.ParseAsync(contentStream, cancellationToken: cancellationToken).ConfigureAwait(false);
         JsonElement root = document.RootElement;
 
         string tagName = GetRequiredString(root, "tag_name");
@@ -86,24 +86,24 @@ internal sealed class GitHubUpdateService
         using HttpResponseMessage response = await HttpClient.SendAsync(
             request,
             HttpCompletionOption.ResponseHeadersRead,
-            cancellationToken).ConfigureAwait(true);
+            cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 
         long? totalBytes = response.Content.Headers.ContentLength ?? update.InstallerSize;
-        await using Stream source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(true);
+        await using Stream source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         await using var target = new FileStream(partialPath, FileMode.Create, FileAccess.Write, FileShare.None);
 
         byte[] buffer = new byte[1024 * 128];
         long bytesReadTotal = 0;
         while (true)
         {
-            int bytesRead = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(true);
+            int bytesRead = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             if (bytesRead == 0)
             {
                 break;
             }
 
-            await target.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(true);
+            await target.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
             bytesReadTotal += bytesRead;
             progress?.Report(new DownloadProgress(bytesReadTotal, totalBytes));
         }
