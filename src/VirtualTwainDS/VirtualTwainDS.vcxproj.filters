@@ -15,6 +15,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="CapabilityStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="dllmain.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -24,11 +27,20 @@
     <ClCompile Include="ScannerIpcClient.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TransferSession.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ImageDib.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="CapabilityStore.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="IpcSession.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="TwainDataSource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -36,6 +48,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ScannerIpcClient.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TransferSession.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ImageDib.h">

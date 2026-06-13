@@ -15,7 +15,7 @@ using MbfTwain.VirtualScannerConfig.Updates;
 
 namespace MbfTwain.VirtualScannerConfig;
 
-public sealed class MainForm : Form
+public sealed partial class MainForm : Form
 {
     private static readonly Color AppBackground = Color.FromArgb(244, 246, 239);
     private static readonly Color SurfaceBackground = Color.FromArgb(255, 255, 252);
@@ -32,10 +32,8 @@ public sealed class MainForm : Form
     private const int ThumbnailCacheLimit = 128;
 
     private readonly object stateLock = new();
-    private readonly object thumbnailCacheLock = new();
     private readonly List<ScannerImageSelection> selectedImages = [];
-    private readonly Dictionary<ThumbnailCacheKey, Bitmap> thumbnailCache = [];
-    private readonly Queue<ThumbnailCacheKey> thumbnailCacheOrder = [];
+    private readonly ThumbnailCache thumbnailCache = new(ThumbnailCacheLimit);
     private readonly ScannerPipeServer pipeServer;
     private readonly GitHubUpdateService updateService = new();
     private readonly CancellationTokenSource updateCancellation = new();
@@ -95,7 +93,7 @@ public sealed class MainForm : Form
                 DisposeControlImages(control);
             }
 
-            DisposeThumbnailCache();
+            thumbnailCache.Dispose();
             pipeServer.Dispose();
             thumbnailLoadCancellation.Dispose();
             updateCancellation.Dispose();
@@ -195,97 +193,6 @@ public sealed class MainForm : Form
         return layout;
     }
 
-    private Control BuildQueueSurface()
-    {
-        var queueCard = BuildSurfacePanel();
-
-        var layout = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 2,
-            Padding = new Padding(18, 16, 18, 16),
-            BackColor = SurfaceBackground,
-        };
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.Controls.Add(BuildQueueHeader(), 0, 0);
-
-        thumbnailStrip.Dock = DockStyle.Fill;
-        thumbnailStrip.AutoScroll = true;
-        thumbnailStrip.WrapContents = true;
-        thumbnailStrip.FlowDirection = FlowDirection.LeftToRight;
-        thumbnailStrip.Margin = new Padding(0, 18, 0, 0);
-        thumbnailStrip.Padding = new Padding(0, 0, 4, 4);
-        thumbnailStrip.BackColor = SurfaceBackground;
-        layout.Controls.Add(thumbnailStrip, 0, 1);
-
-        queueCard.Controls.Add(layout);
-        return queueCard;
-    }
-
-    private Control BuildQueueHeader()
-    {
-        var header = new TableLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            ColumnCount = 3,
-            RowCount = 2,
-            AutoSize = true,
-            BackColor = SurfaceBackground,
-            Margin = new Padding(0),
-        };
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-        header.Controls.Add(
-            new Label
-            {
-                AutoSize = true,
-                Text = "待扫描图片",
-                Font = new Font(Control.DefaultFont, FontStyle.Bold),
-                ForeColor = Color.FromArgb(33, 43, 37),
-                Margin = new Padding(0, 0, 12, 0),
-            },
-            0,
-            0);
-
-        ConfigureClearImagesLink();
-        header.Controls.Add(clearImagesLink, 1, 0);
-
-        var triggerButton = new Button
-        {
-            Text = "开始扫描",
-            Width = 112,
-            Height = 46,
-            FlatStyle = FlatStyle.Flat,
-            BackColor = AccentColor,
-            ForeColor = Color.White,
-            Font = new Font(Font, FontStyle.Bold),
-            Margin = new Padding(12, 0, 0, 0),
-            Anchor = AnchorStyles.Top | AnchorStyles.Right,
-        };
-        triggerButton.FlatAppearance.BorderSize = 0;
-        triggerButton.Click += (_, _) => TriggerScan();
-        header.Controls.Add(triggerButton, 2, 0);
-        header.SetRowSpan(triggerButton, 2);
-
-        var subtitle = new Label
-        {
-            AutoSize = true,
-            Text = "用缩略图两侧箭头调整顺序，列表顺序就是扫描传输顺序。",
-            ForeColor = MutedTextColor,
-            Margin = new Padding(0, 6, 0, 0),
-        };
-        header.Controls.Add(subtitle, 0, 1);
-        header.SetColumnSpan(subtitle, 2);
-
-        return header;
-    }
-
     private static Panel BuildSurfacePanel()
     {
         var panel = new Panel
@@ -305,18 +212,6 @@ public sealed class MainForm : Form
     private void UpdateSettingsSummary()
     {
         settingsSummaryLabel.Text = $"{pixelType} · {paperSize} · {scanDpi} DPI · {(duplexEnabled ? "双面" : "单面")}";
-    }
-
-    private void ConfigureClearImagesLink()
-    {
-        clearImagesLink.AutoSize = true;
-        clearImagesLink.Text = "清空队列";
-        clearImagesLink.LinkColor = Color.FromArgb(38, 100, 171);
-        clearImagesLink.ActiveLinkColor = Color.FromArgb(24, 75, 132);
-        clearImagesLink.VisitedLinkColor = clearImagesLink.LinkColor;
-        clearImagesLink.Margin = new Padding(0, 2, 0, 0);
-        clearImagesLink.LinkBehavior = LinkBehavior.AlwaysUnderline;
-        clearImagesLink.LinkClicked += (_, _) => ClearImages();
     }
 
     private void StartSilentUpdateCheck()
@@ -1004,13 +899,6 @@ public sealed class MainForm : Form
         DiagnosticsLog.Write("UI", "HideScanUi applied and window hidden");
     }
 
-    private void RefreshQueueVisuals()
-    {
-        NormalizeSelection();
-        RefreshThumbnailStrip();
-        UpdateStatus();
-    }
-
     private void NormalizeSelection()
     {
         lock (stateLock)
@@ -1228,7 +1116,7 @@ public sealed class MainForm : Form
         state.HasLoadedThumbnail = false;
         int requestId = ++state.ThumbnailRequestId;
 
-        Image? cached = TryCloneCachedThumbnail(cacheKey);
+        Image? cached = thumbnailCache.TryClone(cacheKey);
         if (cached is not null)
         {
             state.HasLoadedThumbnail = true;
@@ -1263,7 +1151,7 @@ public sealed class MainForm : Form
                 return;
             }
 
-            StoreCachedThumbnail(cacheKey, thumbnail);
+            thumbnailCache.Store(cacheKey, thumbnail);
         }
         else
         {
@@ -1308,55 +1196,8 @@ public sealed class MainForm : Form
         state.HasLoadedThumbnail = true;
         Image thumbnail = failed
             ? CreateFallbackThumbnail(size, "无法预览")
-            : TryCloneCachedThumbnail(cacheKey) ?? CreateFallbackThumbnail(size, "无法预览");
+            : thumbnailCache.TryClone(cacheKey) ?? CreateFallbackThumbnail(size, "无法预览");
         ReplacePictureBoxImage(state.PictureBox, thumbnail);
-    }
-
-    private Image? TryCloneCachedThumbnail(ThumbnailCacheKey cacheKey)
-    {
-        lock (thumbnailCacheLock)
-        {
-            return thumbnailCache.TryGetValue(cacheKey, out Bitmap? cached)
-                ? new Bitmap(cached)
-                : null;
-        }
-    }
-
-    private void StoreCachedThumbnail(ThumbnailCacheKey cacheKey, Bitmap thumbnail)
-    {
-        lock (thumbnailCacheLock)
-        {
-            if (thumbnailCache.ContainsKey(cacheKey))
-            {
-                thumbnail.Dispose();
-                return;
-            }
-
-            thumbnailCache.Add(cacheKey, thumbnail);
-            thumbnailCacheOrder.Enqueue(cacheKey);
-            while (thumbnailCache.Count > ThumbnailCacheLimit && thumbnailCacheOrder.Count > 0)
-            {
-                ThumbnailCacheKey oldestKey = thumbnailCacheOrder.Dequeue();
-                if (thumbnailCache.Remove(oldestKey, out Bitmap? oldestThumbnail))
-                {
-                    oldestThumbnail.Dispose();
-                }
-            }
-        }
-    }
-
-    private void DisposeThumbnailCache()
-    {
-        lock (thumbnailCacheLock)
-        {
-            foreach (Bitmap thumbnail in thumbnailCache.Values)
-            {
-                thumbnail.Dispose();
-            }
-
-            thumbnailCache.Clear();
-            thumbnailCacheOrder.Clear();
-        }
     }
 
     private void AddThumbnailActionControls(Panel tile, int index)
@@ -1818,14 +1659,6 @@ public sealed class MainForm : Form
         int top = (target.Height - height) / 2;
         return new Rectangle(left, top, width, height);
     }
-
-    private readonly record struct ThumbnailCacheKey(
-        string Path,
-        long LastWriteTimeUtcTicks,
-        long Length,
-        int RotationDegrees,
-        int Width,
-        int Height);
 
     private sealed class ThumbnailTileState(PictureBox pictureBox)
     {

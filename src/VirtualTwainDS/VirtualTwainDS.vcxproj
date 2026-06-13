@@ -90,14 +90,19 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="CapabilityStore.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="ImageDib.cpp" />
     <ClCompile Include="ScannerIpcClient.cpp" />
+    <ClCompile Include="TransferSession.cpp" />
     <ClCompile Include="TwainDataSource.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="CapabilityStore.h" />
     <ClInclude Include="ImageDib.h" />
+    <ClInclude Include="IpcSession.h" />
     <ClInclude Include="ScannerIpcClient.h" />
+    <ClInclude Include="TransferSession.h" />
     <ClInclude Include="TwainDataSource.h" />
     <ClInclude Include="..\..\external\twain\2.4\twain.h" />
   </ItemGroup>

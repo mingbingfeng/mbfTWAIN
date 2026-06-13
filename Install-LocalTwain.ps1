@@ -223,7 +223,7 @@ function Build-NativeX64([string]$ScopeSdk) {
     Invoke-Checked {
         & $cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MD /DNDEBUG /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WINDOWS /D_USRDLL /D_WINDLL `
             /I"$Root\src\VirtualTwainDS" /I"$TwainHeaderDir" /I"$vc\include" /I"$sdk\include\um" /I"$sdk\include\shared" /I"$sdk\include\ucrt" `
-            /LD "$Root\src\VirtualTwainDS\dllmain.cpp" "$Root\src\VirtualTwainDS\ImageDib.cpp" "$Root\src\VirtualTwainDS\ScannerIpcClient.cpp" "$Root\src\VirtualTwainDS\TwainDataSource.cpp" `
+            /LD "$Root\src\VirtualTwainDS\dllmain.cpp" "$Root\src\VirtualTwainDS\ImageDib.cpp" "$Root\src\VirtualTwainDS\ScannerIpcClient.cpp" "$Root\src\VirtualTwainDS\CapabilityStore.cpp" "$Root\src\VirtualTwainDS\TransferSession.cpp" "$Root\src\VirtualTwainDS\TwainDataSource.cpp" `
             /Fo"$dsObjDir\\" /Fe"$outDir\mbfVirtualTwainDS.ds" /Fd"$dsObjDir\mbfVirtualTwainDS.pdb" `
             /link /NOLOGO /DEF:"$Root\src\VirtualTwainDS\VirtualTwainDS.def" /SUBSYSTEM:WINDOWS /LIBPATH:"$vc\lib" /LIBPATH:"$sdk\lib" windowscodecs.lib ole32.lib uuid.lib advapi32.lib
     } "x64 DS build"
@@ -258,7 +258,7 @@ function Build-NativeWin32([string]$ScopeSdk, [string]$MsvcToolRoot, [string]$Ki
     Invoke-Checked {
         & $cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MD /DNDEBUG /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WINDOWS /D_USRDLL /D_WINDLL `
             /I"$Root\src\VirtualTwainDS" /I"$TwainHeaderDir" /I"$vcInc" /I"$sdkInc\um" /I"$sdkInc\shared" /I"$sdkInc\ucrt" `
-            /LD "$Root\src\VirtualTwainDS\dllmain.cpp" "$Root\src\VirtualTwainDS\ImageDib.cpp" "$Root\src\VirtualTwainDS\ScannerIpcClient.cpp" "$Root\src\VirtualTwainDS\TwainDataSource.cpp" `
+            /LD "$Root\src\VirtualTwainDS\dllmain.cpp" "$Root\src\VirtualTwainDS\ImageDib.cpp" "$Root\src\VirtualTwainDS\ScannerIpcClient.cpp" "$Root\src\VirtualTwainDS\CapabilityStore.cpp" "$Root\src\VirtualTwainDS\TransferSession.cpp" "$Root\src\VirtualTwainDS\TwainDataSource.cpp" `
             /Fo"$dsObjDir\\" /Fe"$outDir\mbfVirtualTwainDS.ds" /Fd"$dsObjDir\mbfVirtualTwainDS.pdb" `
             /link /NOLOGO /DEF:"$Root\src\VirtualTwainDS\VirtualTwainDS.def" /SUBSYSTEM:WINDOWS /LIBPATH:"$vcLib" /LIBPATH:"$sdkLib\um\x86" /LIBPATH:"$sdkLib\ucrt\x86" windowscodecs.lib ole32.lib uuid.lib advapi32.lib
     } "Win32 DS build"

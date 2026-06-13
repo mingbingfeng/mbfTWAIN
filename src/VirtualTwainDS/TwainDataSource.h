@@ -15,10 +15,12 @@
 #include <optional>
 #include <string>
 #include <thread>
-#include <vector>
 
+#include "CapabilityStore.h"
 #include "ImageDib.h"
+#include "IpcSession.h"
 #include "ScannerIpcClient.h"
+#include "TransferSession.h"
 #include "twain.h"
 
 namespace mbf::twain
@@ -45,25 +47,6 @@ public:
         TW_MEMREF data);
 
 private:
-    struct ScannerSettings
-    {
-        TW_BOOL duplexEnabled = FALSE;
-        TW_UINT16 pixelType = TWPT_RGB;
-        TW_UINT16 paperSize = TWSS_A4LETTER;
-        TW_FIX32 xResolution{};
-        TW_FIX32 yResolution{};
-        TW_UINT16 transferMechanism = TWSX_NATIVE;
-        TW_INT16 transferCount = -1;
-    };
-
-    struct MemoryTransferState
-    {
-        bool active = false;
-        TW_UINT32 imageIndex = 0;
-        TW_UINT32 nextRow = 0;
-        RasterImage image{};
-    };
-
     VirtualTwainDataSource();
     ~VirtualTwainDataSource();
 
@@ -119,6 +102,7 @@ private:
 
     TW_UINT16 Succeed(TW_UINT16 conditionCode = TWCC_SUCCESS) noexcept;
     TW_UINT16 Fail(TW_UINT16 conditionCode) noexcept;
+    TW_UINT16 CompleteCapabilityResult(CapabilityResult result) noexcept;
     bool IsAtLeast(TwainState state) const noexcept;
 
     static TW_IDENTITY BuildSourceIdentity() noexcept;
@@ -128,19 +112,11 @@ private:
     TwainState state_ = TwainState::SourceLoaded;
     TW_IDENTITY identity_{};
     TW_STATUS lastStatus_{};
-    ScannerSettings settings_{};
+    CapabilityStore capabilities_{};
     bool transferReady_ = false;
     bool transferReadyNotified_ = false;
-    bool awaitingUiSelection_ = false;
-    bool closeDsRequest_ = false;
-    bool closeDsRequestNotified_ = false;
-    bool scanUiHiddenForCurrentTransfer_ = false;
-    std::uint32_t pendingIpcRevision_ = 0;
-    TW_UINT32 pendingTransferIndex_ = 0;
-    bool hasCurrentTransferImage_ = false;
-    TW_UINT32 currentTransferImageIndex_ = 0;
-    std::vector<ScannerIpcImage> pendingImages_;
-    MemoryTransferState memoryTransfer_{};
+    IpcSession ipcSession_{};
+    TransferSession transferSession_{};
     TW_ENTRYPOINT entryPoint_{};
     std::optional<TW_IDENTITY> openOrigin_;
     std::condition_variable transferReadyWatcherCv_;
