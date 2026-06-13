@@ -27,6 +27,8 @@ public sealed partial class MainForm : Form
     private static readonly string[] PaperSizeOptions = ["A4", "A3"];
     private static readonly int[] DpiOptions = [150, 200, 300, 600];
     private static readonly Size ThumbnailImageSize = new(172, 172);
+    private const int DefaultTransferBufferDelayMilliseconds = 100;
+    private const int MaxTransferBufferDelayMilliseconds = 5000;
     private const int MaxThumbnailSourcePixels = 1_048_576;
     private const int MaxPreviewImagePixels = 16_777_216;
     private const int ThumbnailCacheLimit = 128;
@@ -47,8 +49,10 @@ public sealed partial class MainForm : Form
     private string pixelType = "RGB";
     private string paperSize = "A4";
     private int scanDpi = 300;
+    private int transferBufferDelayMilliseconds = DefaultTransferBufferDelayMilliseconds;
     private int selectedImageIndex = -1;
     private ReleaseUpdateInfo? latestRelease;
+    private TransferProgressDialog? transferProgressDialog;
 
     private readonly FlowLayoutPanel thumbnailStrip = new();
     private readonly LinkLabel clearImagesLink = new();
@@ -70,7 +74,9 @@ public sealed partial class MainForm : Form
             GetSnapshot,
             sessionSettings => PostPipeCallback(() => BeginScanSession(sessionSettings)),
             acknowledgedRevision => PostPipeCallback(() => HideScanUi(acknowledgedRevision)),
-            acknowledgedRevision => PostPipeCallback(() => AcknowledgeScan(acknowledgedRevision)));
+            acknowledgedRevision => PostPipeCallback(() => AcknowledgeScan(acknowledgedRevision)),
+            (progressRevision, completedImages, totalImages) => PostPipeCallback(() =>
+                ApplyTransferProgress(progressRevision, completedImages, totalImages)));
         BuildLayout();
         UpdateSettingsSummary();
         RefreshQueueVisuals();
@@ -94,6 +100,7 @@ public sealed partial class MainForm : Form
             }
 
             thumbnailCache.Dispose();
+            transferProgressDialog?.Dispose();
             pipeServer.Dispose();
             thumbnailLoadCancellation.Dispose();
             updateCancellation.Dispose();
@@ -211,7 +218,8 @@ public sealed partial class MainForm : Form
 
     private void UpdateSettingsSummary()
     {
-        settingsSummaryLabel.Text = $"{pixelType} · {paperSize} · {scanDpi} DPI · {(duplexEnabled ? "双面" : "单面")}";
+        settingsSummaryLabel.Text =
+            $"{pixelType} · {paperSize} · {scanDpi} DPI · {(duplexEnabled ? "双面" : "单面")} · 间隔 {transferBufferDelayMilliseconds}ms";
     }
 
     private void StartSilentUpdateCheck()
@@ -308,12 +316,14 @@ public sealed partial class MainForm : Form
         string currentPixelType;
         string currentPaperSize;
         int currentDpi;
+        int currentTransferBufferDelayMilliseconds;
         lock (stateLock)
         {
             currentDuplex = duplexEnabled;
             currentPixelType = pixelType;
             currentPaperSize = paperSize;
             currentDpi = scanDpi;
+            currentTransferBufferDelayMilliseconds = transferBufferDelayMilliseconds;
         }
 
         using var dialog = new Form
@@ -324,7 +334,7 @@ public sealed partial class MainForm : Form
             MinimizeBox = false,
             MaximizeBox = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(380, 320),
+            ClientSize = new Size(420, 360),
             BackColor = SurfaceBackground,
         };
 
@@ -332,13 +342,13 @@ public sealed partial class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
-            RowCount = 6,
+            RowCount = 7,
             Padding = new Padding(16),
             BackColor = SurfaceBackground,
         };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int row = 0; row < 5; row++)
+        for (int row = 0; row < 6; row++)
         {
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         }
@@ -355,14 +365,24 @@ public sealed partial class MainForm : Form
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 6, 0, 8),
         };
+        var transferDelayInput = new NumericUpDown
+        {
+            Dock = DockStyle.Top,
+            Minimum = 0,
+            Maximum = MaxTransferBufferDelayMilliseconds,
+            Increment = 25,
+            Value = NormalizeTransferBufferDelayMilliseconds(currentTransferBufferDelayMilliseconds),
+            Margin = new Padding(0, 0, 0, 8),
+        };
 
         AddSettingsDialogRow(layout, "像素", pixelInput, 0);
         AddSettingsDialogRow(layout, "纸张", paperInput, 1);
         AddSettingsDialogRow(layout, "DPI", dpiInput, 2);
         layout.Controls.Add(new Label { AutoSize = true, Text = string.Empty, Margin = new Padding(0) }, 0, 3);
         layout.Controls.Add(duplexInput, 1, 3);
+        AddSettingsDialogRow(layout, "送图间隔(ms)", transferDelayInput, 4);
         Control updatePanel = BuildUpdateSettingsPanel(dialog);
-        layout.Controls.Add(updatePanel, 0, 4);
+        layout.Controls.Add(updatePanel, 0, 5);
         layout.SetColumnSpan(updatePanel, 2);
 
         var buttons = new FlowLayoutPanel
@@ -376,7 +396,7 @@ public sealed partial class MainForm : Form
         var cancelButton = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Width = 76 };
         buttons.Controls.Add(okButton);
         buttons.Controls.Add(cancelButton);
-        layout.Controls.Add(buttons, 0, 5);
+        layout.Controls.Add(buttons, 0, 6);
         layout.SetColumnSpan(buttons, 2);
 
         dialog.AcceptButton = okButton;
@@ -392,7 +412,8 @@ public sealed partial class MainForm : Form
             duplexInput.Checked,
             pixelInput.SelectedItem?.ToString() ?? "RGB",
             paperInput.SelectedItem?.ToString() ?? "A4",
-            Convert.ToInt32(dpiInput.SelectedItem ?? 300));
+            Convert.ToInt32(dpiInput.SelectedItem ?? 300),
+            Convert.ToInt32(transferDelayInput.Value));
     }
 
     private Control BuildUpdateSettingsPanel(IWin32Window owner)
@@ -588,7 +609,12 @@ public sealed partial class MainForm : Form
         layout.Controls.Add(control, 1, row);
     }
 
-    private void ApplySettingsFromDialog(bool duplex, string selectedPixelType, string selectedPaperSize, int selectedDpi)
+    private void ApplySettingsFromDialog(
+        bool duplex,
+        string selectedPixelType,
+        string selectedPaperSize,
+        int selectedDpi,
+        int selectedTransferBufferDelayMilliseconds)
     {
         lock (stateLock)
         {
@@ -596,11 +622,18 @@ public sealed partial class MainForm : Form
             pixelType = PixelTypeOptions.Contains(selectedPixelType) ? selectedPixelType : "RGB";
             paperSize = PaperSizeOptions.Contains(selectedPaperSize) ? selectedPaperSize : "A4";
             scanDpi = DpiOptions.Contains(selectedDpi) ? selectedDpi : 300;
+            transferBufferDelayMilliseconds =
+                NormalizeTransferBufferDelayMilliseconds(selectedTransferBufferDelayMilliseconds);
             revision++;
         }
 
         UpdateSettingsSummary();
         UpdateStatus();
+    }
+
+    private static int NormalizeTransferBufferDelayMilliseconds(int delayMilliseconds)
+    {
+        return Math.Clamp(delayMilliseconds, 0, MaxTransferBufferDelayMilliseconds);
     }
 
     private bool AddImages()
@@ -686,6 +719,16 @@ public sealed partial class MainForm : Form
 
         if (removed)
         {
+            bool stillScanning;
+            lock (stateLock)
+            {
+                stillScanning = scanRequested;
+            }
+            if (!stillScanning)
+            {
+                CloseTransferProgressDialog();
+            }
+
             RefreshQueueVisuals();
         }
     }
@@ -700,6 +743,7 @@ public sealed partial class MainForm : Form
             revision++;
         }
 
+        CloseTransferProgressDialog();
         RefreshQueueVisuals();
     }
 
@@ -757,6 +801,8 @@ public sealed partial class MainForm : Form
     private void TriggerScan()
     {
         bool hasImages;
+        uint scanRevision = 0;
+        int transferImageCount = 0;
         lock (stateLock)
         {
             hasImages = selectedImages.Count > 0;
@@ -773,11 +819,18 @@ public sealed partial class MainForm : Form
             {
                 scanRequested = true;
                 revision++;
+                scanRevision = revision;
+                transferImageCount = selectedImages.Count;
             }
         }
 
         UpdateSettingsSummary();
         UpdateStatus();
+        if (scanRevision != 0 && transferImageCount > 0)
+        {
+            ShowTransferProgress(scanRevision, completedImages: 0, totalImages: transferImageCount, waitingForTwain: true);
+            Hide();
+        }
     }
 
     private ScannerStateSnapshot GetSnapshot()
@@ -791,6 +844,7 @@ public sealed partial class MainForm : Form
                 paperSize,
                 scanDpi,
                 scanDpi,
+                transferBufferDelayMilliseconds,
                 scanRequested,
                 selectedImages.ToArray());
         }
@@ -806,6 +860,7 @@ public sealed partial class MainForm : Form
             return;
         }
 
+        CloseTransferProgressDialog();
         lock (stateLock)
         {
             if (sessionSettings is not null)
@@ -875,6 +930,7 @@ public sealed partial class MainForm : Form
             return;
         }
 
+        CloseTransferProgressDialog();
         RefreshQueueVisuals();
         Hide();
         DiagnosticsLog.Write("UI", "AcknowledgeScan applied and window hidden");
@@ -895,8 +951,137 @@ public sealed partial class MainForm : Form
             return;
         }
 
+        if (acknowledgedRevision != 0 && IsTransferProgressDialogVisible())
+        {
+            DiagnosticsLog.Write("UI", "HideScanUi deferred because transfer progress dialog is visible");
+            return;
+        }
+
+        if (acknowledgedRevision == 0)
+        {
+            CloseTransferProgressDialog();
+        }
+
         Hide();
         DiagnosticsLog.Write("UI", "HideScanUi applied and window hidden");
+    }
+
+    private void ApplyTransferProgress(uint progressRevision, int completedImages, int totalImages)
+    {
+        bool shouldShow;
+        int selectedImageCount;
+        lock (stateLock)
+        {
+            shouldShow = scanRequested && progressRevision <= revision;
+            selectedImageCount = selectedImages.Count;
+        }
+
+        if (!shouldShow)
+        {
+            DiagnosticsLog.Write(
+                "UI",
+                $"Transfer progress ignored revision={progressRevision} completed={completedImages} total={totalImages}");
+            return;
+        }
+
+        int normalizedTotal = Math.Max(1, totalImages);
+        int normalizedCompleted = Math.Clamp(completedImages, 0, normalizedTotal);
+        if (normalizedCompleted >= normalizedTotal)
+        {
+            CloseTransferProgressDialog();
+            DiagnosticsLog.Write(
+                "UI",
+                $"Transfer progress completed revision={progressRevision} completed={normalizedCompleted} total={normalizedTotal}");
+            return;
+        }
+
+        ShowTransferProgress(progressRevision, normalizedCompleted, normalizedTotal, waitingForTwain: false);
+    }
+
+    private void ShowTransferProgress(
+        uint progressRevision,
+        int completedImages,
+        int totalImages,
+        bool waitingForTwain)
+    {
+        if (IsDisposed || Disposing)
+        {
+            return;
+        }
+
+        int normalizedTotal = Math.Max(1, totalImages);
+        int normalizedCompleted = Math.Clamp(completedImages, 0, normalizedTotal);
+        transferProgressDialog ??= CreateTransferProgressDialog();
+        transferProgressDialog.UpdateProgress(progressRevision, normalizedCompleted, normalizedTotal, waitingForTwain);
+
+        if (!transferProgressDialog.Visible)
+        {
+            transferProgressDialog.Show();
+            Enabled = false;
+        }
+
+        transferProgressDialog.BringToFront();
+        transferProgressDialog.Activate();
+    }
+
+    private TransferProgressDialog CreateTransferProgressDialog()
+    {
+        var dialog = new TransferProgressDialog();
+        dialog.CancelRequested += (_, _) => CancelTransferProgressRequest();
+        dialog.FormClosed += (_, _) =>
+        {
+            if (ReferenceEquals(transferProgressDialog, dialog))
+            {
+                transferProgressDialog = null;
+            }
+
+            if (!IsDisposed && !Disposing)
+            {
+                Enabled = true;
+            }
+        };
+        return dialog;
+    }
+
+    private void CancelTransferProgressRequest()
+    {
+        lock (stateLock)
+        {
+            if (scanRequested)
+            {
+                scanRequested = false;
+                selectedImages.Clear();
+                selectedImageIndex = -1;
+                revision++;
+            }
+        }
+
+        CloseTransferProgressDialog();
+        RefreshQueueVisuals();
+        UpdateStatus();
+        DiagnosticsLog.Write("UI", "Transfer progress dialog canceled by user");
+    }
+
+    private bool IsTransferProgressDialogVisible()
+    {
+        return transferProgressDialog is { IsDisposed: false, Visible: true };
+    }
+
+    private void CloseTransferProgressDialog()
+    {
+        TransferProgressDialog? dialog = transferProgressDialog;
+        transferProgressDialog = null;
+        if (!IsDisposed && !Disposing)
+        {
+            Enabled = true;
+        }
+
+        if (dialog is null || dialog.IsDisposed)
+        {
+            return;
+        }
+
+        dialog.Close();
     }
 
     private void NormalizeSelection()

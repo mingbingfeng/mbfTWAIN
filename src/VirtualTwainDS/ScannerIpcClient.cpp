@@ -189,6 +189,7 @@ bool ParseStateResponse(const std::string& response, mbf::twain::ScannerIpcState
         const std::string_view kPaper("paper ", 6);
         const std::string_view kXRes("xres ", 5);
         const std::string_view kYRes("yres ", 5);
+        const std::string_view kTransferDelayMs("transferDelayMs ", 16);
         const std::string_view kScan("scan ", 5);
         const std::string_view kImage("image ", 6);
 
@@ -217,6 +218,11 @@ bool ParseStateResponse(const std::string& response, mbf::twain::ScannerIpcState
         else if (StartsWith(line, kYRes) && ParseUInt32(std::string_view(line).substr(kYRes.size()), number))
         {
             parsed.yResolution = number;
+        }
+        else if (StartsWith(line, kTransferDelayMs) &&
+                 ParseUInt32(std::string_view(line).substr(kTransferDelayMs.size()), number))
+        {
+            parsed.transferBufferDelayMilliseconds = (std::min)(number, static_cast<std::uint32_t>(5000));
         }
         else if (StartsWith(line, kScan) && ParseBool(std::string_view(line).substr(kScan.size()), boolean))
         {
@@ -285,6 +291,22 @@ bool ScannerIpcClient::TryGetState(ScannerIpcState& state, DWORD timeoutMillisec
     std::string response;
     return SendCommand("GET_STATE\n", response, timeoutMilliseconds) &&
            ParseStateResponse(response, state);
+}
+
+bool ScannerIpcClient::ReportTransferProgress(
+    std::uint32_t revision,
+    std::uint32_t completedImages,
+    std::uint32_t totalImages,
+    DWORD timeoutMilliseconds) const
+{
+    std::string response;
+    std::ostringstream command;
+    command << "TRANSFER_PROGRESS "
+            << revision << ' '
+            << completedImages << ' '
+            << totalImages << "\n";
+    return SendCommand(command.str(), response, timeoutMilliseconds) &&
+           response == "OK PROGRESS\n";
 }
 
 bool ScannerIpcClient::HideScanUi(std::uint32_t revision, DWORD timeoutMilliseconds) const

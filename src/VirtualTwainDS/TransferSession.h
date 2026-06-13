@@ -23,13 +23,17 @@ namespace mbf::twain
 class TransferSession final
 {
 public:
-    void Begin(std::uint32_t revision, std::vector<ScannerIpcImage>&& images);
+    void Begin(
+        std::uint32_t revision,
+        std::vector<ScannerIpcImage>&& images,
+        std::uint32_t transferBufferDelayMilliseconds);
     void Clear() noexcept;
     void DiscardImages() noexcept;
 
     std::uint32_t Revision() const noexcept { return revision_; }
     bool HasRevision() const noexcept { return revision_ != 0; }
     std::uint32_t TakeRevision() noexcept;
+    std::uint32_t TransferBufferDelayMilliseconds() const noexcept { return transferBufferDelayMilliseconds_; }
 
     size_t ImageCount() const noexcept { return images_.size(); }
     void LimitImages(size_t imageCount);
@@ -72,6 +76,7 @@ private:
     };
 
     std::uint32_t revision_ = 0;
+    std::uint32_t transferBufferDelayMilliseconds_ = 100;
     TW_UINT32 pendingImageIndex_ = 0;
     bool hasCurrentImage_ = false;
     TW_UINT32 currentImageIndex_ = 0;

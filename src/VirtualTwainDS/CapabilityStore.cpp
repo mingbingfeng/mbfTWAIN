@@ -8,7 +8,7 @@
 namespace
 {
 
-constexpr std::array<TW_UINT16, 14> kSupportedCapabilities = {
+constexpr std::array<TW_UINT16, 16> kSupportedCapabilities = {
     CAP_XFERCOUNT,
     CAP_SUPPORTEDCAPS,
     CAP_SUPPORTEDDATS,
@@ -23,9 +23,11 @@ constexpr std::array<TW_UINT16, 14> kSupportedCapabilities = {
     ICAP_AUTOMATICBORDERDETECTION,
     ICAP_AUTOMATICDESKEW,
     ICAP_XFERMECH,
+    ICAP_EXTIMAGEINFO,
+    ICAP_SUPPORTEDEXTIMAGEINFO,
 };
 
-constexpr std::array<TW_UINT32, 14> kSupportedDataArgumentTypes = {
+constexpr std::array<TW_UINT32, 15> kSupportedDataArgumentTypes = {
     (DG_CONTROL << 16) | DAT_CAPABILITY,
     (DG_CONTROL << 16) | DAT_ENTRYPOINT,
     (DG_CONTROL << 16) | DAT_EVENT,
@@ -36,6 +38,7 @@ constexpr std::array<TW_UINT32, 14> kSupportedDataArgumentTypes = {
     (DG_CONTROL << 16) | DAT_USERINTERFACE,
     (DG_CONTROL << 16) | DAT_XFERGROUP,
     (DG_IMAGE << 16) | DAT_IMAGEINFO,
+    (DG_IMAGE << 16) | DAT_EXTIMAGEINFO,
     (DG_IMAGE << 16) | DAT_IMAGEMEMXFER,
     (DG_IMAGE << 16) | DAT_IMAGENATIVEXFER,
     (DG_CONTROL << 16) | DAT_CALLBACK,
@@ -48,6 +51,14 @@ constexpr std::array<TW_UINT16, 3> kPixelTypeValues = {TWPT_BW, TWPT_GRAY, TWPT_
 constexpr std::array<TW_UINT16, 2> kTransferMechanismValues = {TWSX_NATIVE, TWSX_MEMORY};
 constexpr std::array<TW_UINT16, 2> kSupportedSizesValues = {TWSS_A4LETTER, TWSS_A3};
 constexpr std::array<TW_INT16, 4> kResolutionWholeValues = {150, 200, 300, 600};
+constexpr std::array<TW_UINT16, 6> kExtendedImageInfoValues = {
+    TWEI_DOCUMENTNUMBER,
+    TWEI_PAGENUMBER,
+    TWEI_CAMERA,
+    TWEI_FRAMENUMBER,
+    TWEI_PAGESIDE,
+    TWEI_PAPERCOUNT,
+};
 
 constexpr TW_UINT32 kMutableCapabilitySupport =
     TWQC_GET | TWQC_SET | TWQC_GETDEFAULT | TWQC_GETCURRENT | TWQC_RESET;
@@ -498,6 +509,7 @@ CapabilityResult CapabilityStore::Get(TW_UINT16 message, pTW_CAPABILITY capabili
 
     case ICAP_AUTOMATICBORDERDETECTION:
     case ICAP_AUTOMATICDESKEW:
+    case ICAP_EXTIMAGEINFO:
         if (message == MSG_GET)
         {
             containerType = TWON_ENUMERATION;
@@ -512,6 +524,14 @@ CapabilityResult CapabilityStore::Get(TW_UINT16 message, pTW_CAPABILITY capabili
         {
             container = BuildOneValue(TWTY_BOOL, TRUE);
         }
+        break;
+
+    case ICAP_SUPPORTEDEXTIMAGEINFO:
+        containerType = TWON_ARRAY;
+        container = BuildArray(
+            TWTY_UINT16,
+            kExtendedImageInfoValues.data(),
+            static_cast<TW_UINT32>(kExtendedImageInfoValues.size()));
         break;
 
     case ICAP_XFERMECH:
@@ -646,6 +666,7 @@ CapabilityResult CapabilityStore::Set(pTW_CAPABILITY capability)
 
     case ICAP_AUTOMATICBORDERDETECTION:
     case ICAP_AUTOMATICDESKEW:
+    case ICAP_EXTIMAGEINFO:
         if (!ReadCapabilityPackedItem(*capability, TWTY_BOOL, packedItem))
         {
             return CapabilityResult::Failure(TWCC_CAPBADOPERATION);
@@ -675,6 +696,7 @@ CapabilityResult CapabilityStore::Set(pTW_CAPABILITY capability)
 
     case CAP_SUPPORTEDCAPS:
     case CAP_SUPPORTEDDATS:
+    case ICAP_SUPPORTEDEXTIMAGEINFO:
         return CapabilityResult::Failure(TWCC_CAPBADOPERATION);
 
     default:
@@ -715,7 +737,11 @@ CapabilityResult CapabilityStore::QuerySupport(pTW_CAPABILITY capability) const
     case ICAP_AUTOMATICBORDERDETECTION:
     case ICAP_AUTOMATICDESKEW:
     case ICAP_XFERMECH:
+    case ICAP_EXTIMAGEINFO:
         support = kMutableCapabilitySupport;
+        break;
+    case ICAP_SUPPORTEDEXTIMAGEINFO:
+        support = kReadOnlyCapabilitySupport;
         break;
     default:
         return CapabilityResult::Failure(TWCC_CAPUNSUPPORTED);
@@ -772,12 +798,14 @@ CapabilityResult CapabilityStore::ResetValue(TW_UINT16 capability) noexcept
         return CapabilityResult::Success();
     case ICAP_AUTOMATICBORDERDETECTION:
     case ICAP_AUTOMATICDESKEW:
+    case ICAP_EXTIMAGEINFO:
         return CapabilityResult::Success();
     case ICAP_XFERMECH:
         settings_.transferMechanism = TWSX_NATIVE;
         return CapabilityResult::Success();
     case CAP_SUPPORTEDCAPS:
     case CAP_SUPPORTEDDATS:
+    case ICAP_SUPPORTEDEXTIMAGEINFO:
         return CapabilityResult::Failure(TWCC_CAPBADOPERATION);
     default:
         return CapabilityResult::Failure(TWCC_CAPUNSUPPORTED);

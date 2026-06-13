@@ -34,6 +34,7 @@ pixel RGB
 paper A3
 xres 300
 yres 300
+transferDelayMs 100
 scan 1
 image C:\scan\front.png
 image C:\scan\back.png
@@ -59,6 +60,18 @@ OK BEGIN_SCAN
 ```
 
 ```text
+TRANSFER_PROGRESS 3 1 2
+```
+
+DS 在开始或完成送图页时发送。第二个数字表示当前会话已完成送出的页数，第三个数字表示本次会话总页数。UI 收到后显示或更新送图进度模态窗；当后续 `ACK_SCAN` 完成会话时自动关闭。
+
+返回：
+
+```text
+OK PROGRESS
+```
+
+```text
 ACK_SCAN 3
 ```
 
@@ -77,6 +90,7 @@ HIDE_SCAN_UI 3
 - `pixel`：`BW`、`GRAY`、`RGB`。
 - `paper`：纸张类型/尺寸，当前支持 `A4`、`A3`；DS 会映射到 TWAIN `ICAP_SUPPORTEDSIZES`。
 - `xres` / `yres`：当前 DPI。
+- `transferDelayMs`：送图缓冲间隔，单位毫秒。默认 `100`，允许 `0` 表示不额外等待；UI 当前限制最大 `5000`。DS 在 Native 页传输完成和 Memory 缓冲块返回前按这个间隔等待，用于给低配机器或较慢 TWAIN 宿主留出处理窗口。
 - `scan`：`1` 表示用户已点击“开始扫描”，DS 下一阶段会把它转为 `MSG_XFERREADY`。
 - `image`：一行一个待扫描图片路径，保持用户选择顺序。
 

@@ -30,6 +30,7 @@ struct ScannerIpcState
     std::wstring paperSize = L"A4";
     std::uint32_t xResolution = 300;
     std::uint32_t yResolution = 300;
+    std::uint32_t transferBufferDelayMilliseconds = 100;
     bool scanRequested = false;
     std::vector<ScannerIpcImage> selectedImages;
 };
@@ -43,6 +44,11 @@ public:
     bool BeginScan(DWORD timeoutMilliseconds = 150) const;
     bool BeginScan(const ScannerIpcState& initialState, DWORD timeoutMilliseconds = 150) const;
     bool TryGetState(ScannerIpcState& state, DWORD timeoutMilliseconds = 150) const;
+    bool ReportTransferProgress(
+        std::uint32_t revision,
+        std::uint32_t completedImages,
+        std::uint32_t totalImages,
+        DWORD timeoutMilliseconds = 150) const;
     bool HideScanUi(std::uint32_t revision, DWORD timeoutMilliseconds = 150) const;
     bool AcknowledgeScan(std::uint32_t revision, DWORD timeoutMilliseconds = 150) const;
 

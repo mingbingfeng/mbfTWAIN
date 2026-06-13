@@ -12,6 +12,7 @@ internal sealed record Options(
     string PaperSize,
     int XResolution,
     int YResolution,
+    int TransferBufferDelayMilliseconds,
     bool ScanRequested,
     int? ScanAfterBeginDelayMilliseconds,
     int MaxConnections,
@@ -42,6 +43,7 @@ internal static class Program
         string paperSize = initialOptions.PaperSize;
         int xResolution = initialOptions.XResolution;
         int yResolution = initialOptions.YResolution;
+        int transferBufferDelayMilliseconds = initialOptions.TransferBufferDelayMilliseconds;
         bool scanRequested = initialOptions.ScanRequested;
         long? scanReadyAtTick = null;
 
@@ -93,7 +95,17 @@ internal static class Program
             if (string.Equals(command, "GET_STATE", StringComparison.Ordinal))
             {
                 MaybePromoteDelayedReady();
-                WriteState(writer, revision, duplexEnabled, pixelType, paperSize, xResolution, yResolution, scanRequested, initialOptions.Images);
+                WriteState(
+                    writer,
+                    revision,
+                    duplexEnabled,
+                    pixelType,
+                    paperSize,
+                    xResolution,
+                    yResolution,
+                    transferBufferDelayMilliseconds,
+                    scanRequested,
+                    initialOptions.Images);
                 continue;
             }
 
@@ -109,6 +121,15 @@ internal static class Program
                 }
 
                 writer.Write("OK BEGIN_SCAN\n");
+                continue;
+            }
+
+            const string progressPrefix = "TRANSFER_PROGRESS ";
+            if (command is not null &&
+                command.StartsWith(progressPrefix, StringComparison.Ordinal) &&
+                TryParseTransferProgress(command.AsSpan(progressPrefix.Length), out _, out _, out _))
+            {
+                writer.Write("OK PROGRESS\n");
                 continue;
             }
 
@@ -148,6 +169,7 @@ internal static class Program
         string paperSize,
         int xResolution,
         int yResolution,
+        int transferBufferDelayMilliseconds,
         bool scanRequested,
         IReadOnlyList<string> images)
     {
@@ -158,6 +180,7 @@ internal static class Program
         writer.WriteLine($"paper {paperSize}");
         writer.WriteLine(FormattableString.Invariant($"xres {xResolution}"));
         writer.WriteLine(FormattableString.Invariant($"yres {yResolution}"));
+        writer.WriteLine(FormattableString.Invariant($"transferDelayMs {transferBufferDelayMilliseconds}"));
         writer.WriteLine(FormattableString.Invariant($"scan {(scanRequested ? 1 : 0)}"));
 
         foreach (string image in images)
@@ -238,6 +261,7 @@ internal static class Program
         string paperSize = "A4";
         int xResolution = 300;
         int yResolution = 300;
+        int transferBufferDelayMilliseconds = 100;
         bool scanRequested = true;
         int? scanAfterBeginDelayMilliseconds = null;
         int maxConnections = 3;
@@ -316,6 +340,17 @@ internal static class Program
                     index++;
                     break;
 
+                case "--transfer-delay-ms":
+                    if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out transferBufferDelayMilliseconds) ||
+                        transferBufferDelayMilliseconds < 0 ||
+                        transferBufferDelayMilliseconds > 5000)
+                    {
+                        return Fail("Invalid --transfer-delay-ms value", out options, out error);
+                    }
+
+                    index++;
+                    break;
+
                 case "--scan":
                     if (!TryParseBoolFlag(value, out scanRequested))
                     {
@@ -380,6 +415,7 @@ internal static class Program
             paperSize,
             xResolution,
             yResolution,
+            transferBufferDelayMilliseconds,
             scanRequested,
             scanAfterBeginDelayMilliseconds,
             maxConnections,
@@ -408,6 +444,28 @@ internal static class Program
         }
     }
 
+    private static bool TryParseTransferProgress(
+        ReadOnlySpan<char> payload,
+        out uint revision,
+        out int completedImages,
+        out int totalImages)
+    {
+        revision = 0;
+        completedImages = 0;
+        totalImages = 0;
+
+        string[] parts = payload.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 3 ||
+            !uint.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out revision) ||
+            !int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out completedImages) ||
+            !int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out totalImages))
+        {
+            return false;
+        }
+
+        return completedImages >= 0 && totalImages > 0;
+    }
+
     private static bool Fail(string message, out Options? options, out string error)
     {
         options = null;
@@ -418,6 +476,6 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.Error.WriteLine(
-            "Usage: FakeScannerPipeServer [--image <path>]... [--connections 3] [--pixel RGB|GRAY|BW] [--paper A4|A3] [--revision n] [--scan-after-begin-delay-ms n]");
+            "Usage: FakeScannerPipeServer [--image <path>]... [--connections 3] [--pixel RGB|GRAY|BW] [--paper A4|A3] [--revision n] [--transfer-delay-ms n] [--scan-after-begin-delay-ms n]");
     }
 }

@@ -16,6 +16,7 @@ public sealed class ScannerPipeServer : IDisposable
     private readonly Action<ScannerSessionSettings?> beginScan;
     private readonly Action<uint> hideScanUi;
     private readonly Action<uint> acknowledgeScan;
+    private readonly Action<uint, int, int> reportTransferProgress;
     private readonly CancellationTokenSource cancellation = new();
     private Task? serverTask;
 
@@ -23,12 +24,14 @@ public sealed class ScannerPipeServer : IDisposable
         Func<ScannerStateSnapshot> getSnapshot,
         Action<ScannerSessionSettings?> beginScan,
         Action<uint> hideScanUi,
-        Action<uint> acknowledgeScan)
+        Action<uint> acknowledgeScan,
+        Action<uint, int, int> reportTransferProgress)
     {
         this.getSnapshot = getSnapshot;
         this.beginScan = beginScan;
         this.hideScanUi = hideScanUi;
         this.acknowledgeScan = acknowledgeScan;
+        this.reportTransferProgress = reportTransferProgress;
     }
 
     public void Start()
@@ -128,12 +131,24 @@ public sealed class ScannerPipeServer : IDisposable
 
         const string ackPrefix = "ACK_SCAN ";
         const string hidePrefix = "HIDE_SCAN_UI ";
+        const string progressPrefix = "TRANSFER_PROGRESS ";
         if (command.StartsWith(hidePrefix, StringComparison.Ordinal) &&
             uint.TryParse(command.AsSpan(hidePrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out uint hideRevision))
         {
             DiagnosticsLog.Write("UI-IPC", $"HIDE_SCAN_UI accepted revision={hideRevision}");
             hideScanUi(hideRevision);
             await writer.WriteAsync("OK HIDE\n").ConfigureAwait(false);
+            return;
+        }
+
+        if (command.StartsWith(progressPrefix, StringComparison.Ordinal) &&
+            TryParseTransferProgress(command.AsSpan(progressPrefix.Length), out uint progressRevision, out int completedImages, out int totalImages))
+        {
+            DiagnosticsLog.Write(
+                "UI-IPC",
+                $"TRANSFER_PROGRESS accepted revision={progressRevision} completed={completedImages} total={totalImages}");
+            reportTransferProgress(progressRevision, completedImages, totalImages);
+            await writer.WriteAsync("OK PROGRESS\n").ConfigureAwait(false);
             return;
         }
 
@@ -159,6 +174,7 @@ public sealed class ScannerPipeServer : IDisposable
         await writer.WriteLineAsync($"paper {snapshot.PaperSize}").ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"xres {snapshot.XResolution}")).ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"yres {snapshot.YResolution}")).ConfigureAwait(false);
+        await writer.WriteLineAsync(FormattableString.Invariant($"transferDelayMs {snapshot.TransferBufferDelayMilliseconds}")).ConfigureAwait(false);
         await writer.WriteLineAsync(FormattableString.Invariant($"scan {(snapshot.ScanRequested ? 1 : 0)}")).ConfigureAwait(false);
         foreach (ScannerImageSelection image in snapshot.SelectedImages)
         {
@@ -236,5 +252,27 @@ public sealed class ScannerPipeServer : IDisposable
         return sawSetting
             ? new ScannerSessionSettings(duplexEnabled, pixelType, paperSize, xResolution, yResolution)
             : null;
+    }
+
+    private static bool TryParseTransferProgress(
+        ReadOnlySpan<char> payload,
+        out uint revision,
+        out int completedImages,
+        out int totalImages)
+    {
+        revision = 0;
+        completedImages = 0;
+        totalImages = 0;
+
+        string[] parts = payload.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 3 ||
+            !uint.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out revision) ||
+            !int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out completedImages) ||
+            !int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out totalImages))
+        {
+            return false;
+        }
+
+        return completedImages >= 0 && totalImages > 0;
     }
 }

@@ -13,6 +13,7 @@ public sealed record ScannerStateSnapshot(
     string PaperSize,
     int XResolution,
     int YResolution,
+    int TransferBufferDelayMilliseconds,
     bool ScanRequested,
     IReadOnlyList<ScannerImageSelection> SelectedImages);
 

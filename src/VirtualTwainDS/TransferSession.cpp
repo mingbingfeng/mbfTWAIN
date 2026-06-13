@@ -6,9 +6,13 @@
 namespace mbf::twain
 {
 
-void TransferSession::Begin(std::uint32_t revision, std::vector<ScannerIpcImage>&& images)
+void TransferSession::Begin(
+    std::uint32_t revision,
+    std::vector<ScannerIpcImage>&& images,
+    std::uint32_t transferBufferDelayMilliseconds)
 {
     revision_ = revision;
+    transferBufferDelayMilliseconds_ = transferBufferDelayMilliseconds;
     pendingImageIndex_ = 0;
     hasCurrentImage_ = false;
     currentImageIndex_ = 0;
@@ -21,6 +25,7 @@ void TransferSession::Clear() noexcept
 {
     images_.clear();
     revision_ = 0;
+    transferBufferDelayMilliseconds_ = 100;
     pendingImageIndex_ = 0;
     hasCurrentImage_ = false;
     currentImageIndex_ = 0;
@@ -31,6 +36,7 @@ void TransferSession::Clear() noexcept
 void TransferSession::DiscardImages() noexcept
 {
     images_.clear();
+    transferBufferDelayMilliseconds_ = 100;
     pendingImageIndex_ = 0;
     hasCurrentImage_ = false;
     currentImageIndex_ = 0;

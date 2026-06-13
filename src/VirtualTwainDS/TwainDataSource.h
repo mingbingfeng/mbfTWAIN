@@ -68,6 +68,7 @@ private:
         TW_MEMREF data,
         std::unique_lock<std::mutex>& lock);
     TW_UINT16 HandleImageInfo(TW_UINT16 message, TW_MEMREF data, std::unique_lock<std::mutex>& lock);
+    TW_UINT16 HandleExtendedImageInfo(TW_UINT16 message, TW_MEMREF data);
     TW_UINT16 HandleImageNativeTransfer(TW_UINT16 message, TW_MEMREF data, std::unique_lock<std::mutex>& lock);
     TW_UINT16 HandleImageMemoryTransfer(TW_UINT16 message, TW_MEMREF data, std::unique_lock<std::mutex>& lock);
     TW_UINT16 HandleStatus(TW_UINT16 message, TW_MEMREF data);
@@ -91,9 +92,15 @@ private:
         TW_UINT32 imageIndex,
         pTW_IMAGEINFO imageInfo,
         std::unique_lock<std::mutex>& lock);
+    bool FillExtendedImageInfo(TW_UINT32 imageIndex, pTW_EXTIMAGEINFO extendedImageInfo) const noexcept;
     bool TryResolveImageInfoIndex(TW_UINT32& imageIndex) const noexcept;
     bool EnsureMemoryTransferReady(std::unique_lock<std::mutex>& lock);
     void ResetMemoryTransfer() noexcept;
+    bool IsUiStopRequested(std::unique_lock<std::mutex>& lock);
+    bool CompleteTransferIfUiStopped(std::unique_lock<std::mutex>& lock);
+    bool LimitTransferToCurrentImageIfUiStopped(std::unique_lock<std::mutex>& lock, TW_UINT32 imageIndex);
+    void ReportTransferProgress(std::unique_lock<std::mutex>& lock, TW_UINT32 completedImages);
+    void ApplyTransferBufferDelay(std::unique_lock<std::mutex>& lock);
     void HideScanUiSession(std::unique_lock<std::mutex>& lock);
     void HideScanUiIfTransferStarted(std::unique_lock<std::mutex>& lock);
     void ClearTransferProgress() noexcept;

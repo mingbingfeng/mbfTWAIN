@@ -375,6 +375,60 @@ int ExpectFailure(const char* label, TW_UINT16 returnCode)
     return 1;
 }
 
+int ExpectExtInfoUInt16(const char* label, const TW_INFO& info, TW_UINT16 infoId, TW_UINT16 expected)
+{
+    if (info.InfoID == infoId &&
+        info.ItemType == TWTY_UINT16 &&
+        info.NumItems == 1 &&
+        info.ReturnCode == TWRC_SUCCESS &&
+        static_cast<TW_UINT16>(info.Item) == expected)
+    {
+        std::printf("%s: %u\n", label, expected);
+        return 0;
+    }
+
+    std::printf(
+        "%s: expected id=%u type=%u count=1 rc=%u item=%u, got id=%u type=%u count=%lu rc=%u item=%llu\n",
+        label,
+        infoId,
+        TWTY_UINT16,
+        TWRC_SUCCESS,
+        expected,
+        info.InfoID,
+        info.ItemType,
+        static_cast<unsigned long>(info.NumItems),
+        info.ReturnCode,
+        static_cast<unsigned long long>(info.Item));
+    return 1;
+}
+
+int ExpectExtInfoUInt32(const char* label, const TW_INFO& info, TW_UINT16 infoId, TW_UINT32 expected)
+{
+    if (info.InfoID == infoId &&
+        info.ItemType == TWTY_UINT32 &&
+        info.NumItems == 1 &&
+        info.ReturnCode == TWRC_SUCCESS &&
+        static_cast<TW_UINT32>(info.Item) == expected)
+    {
+        std::printf("%s: %lu\n", label, static_cast<unsigned long>(expected));
+        return 0;
+    }
+
+    std::printf(
+        "%s: expected id=%u type=%u count=1 rc=%u item=%lu, got id=%u type=%u count=%lu rc=%u item=%llu\n",
+        label,
+        infoId,
+        TWTY_UINT32,
+        TWRC_SUCCESS,
+        static_cast<unsigned long>(expected),
+        info.InfoID,
+        info.ItemType,
+        static_cast<unsigned long>(info.NumItems),
+        info.ReturnCode,
+        static_cast<unsigned long long>(info.Item));
+    return 1;
+}
+
 int ExpectStatusCondition(
     const char* label,
     DsEntry entry,
@@ -513,7 +567,9 @@ int wmain(int argc, wchar_t** argv)
          !EnumerationContains(supported.hContainer, TWTY_UINT16, ICAP_PIXELTYPE) ||
          !EnumerationContains(supported.hContainer, TWTY_UINT16, CAP_XFERCOUNT) ||
          !EnumerationContains(supported.hContainer, TWTY_UINT16, CAP_DUPLEXENABLED) ||
-         !EnumerationContains(supported.hContainer, TWTY_UINT16, ICAP_SUPPORTEDSIZES)))
+         !EnumerationContains(supported.hContainer, TWTY_UINT16, ICAP_SUPPORTEDSIZES) ||
+         !EnumerationContains(supported.hContainer, TWTY_UINT16, ICAP_EXTIMAGEINFO) ||
+         !EnumerationContains(supported.hContainer, TWTY_UINT16, ICAP_SUPPORTEDEXTIMAGEINFO)))
     {
         std::printf("CAP_SUPPORTEDCAPS: missing required capabilities\n");
         ++failures;
@@ -531,6 +587,7 @@ int wmain(int argc, wchar_t** argv)
          !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_EVENT) ||
          !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_PENDINGXFERS) ||
          !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_CONTROL << 16) | DAT_XFERGROUP) ||
+         !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_IMAGE << 16) | DAT_EXTIMAGEINFO) ||
          !ArrayContains(supportedDats.hContainer, TWTY_UINT32, (DG_IMAGE << 16) | DAT_IMAGENATIVEXFER)))
     {
         std::printf("CAP_SUPPORTEDDATS: missing required DATs\n");
@@ -709,6 +766,33 @@ int wmain(int argc, wchar_t** argv)
             TWTY_UINT16,
             TWSX_NATIVE);
     }
+
+    failures += ExpectOneValue(
+        "ICAP_EXTIMAGEINFO/current true",
+        entry,
+        app,
+        ICAP_EXTIMAGEINFO,
+        TWTY_BOOL,
+        TRUE);
+
+    TW_CAPABILITY supportedExtImageInfo{};
+    supportedExtImageInfo.Cap = ICAP_SUPPORTEDEXTIMAGEINFO;
+    failures += ExpectSuccess(
+        "ICAP_SUPPORTEDEXTIMAGEINFO/MSG_GET",
+        entry(&app, DG_CONTROL, DAT_CAPABILITY, MSG_GET, &supportedExtImageInfo));
+    if (failures == 0 &&
+        (supportedExtImageInfo.ConType != TWON_ARRAY ||
+         !ArrayContains(supportedExtImageInfo.hContainer, TWTY_UINT16, TWEI_DOCUMENTNUMBER) ||
+         !ArrayContains(supportedExtImageInfo.hContainer, TWTY_UINT16, TWEI_PAGENUMBER) ||
+         !ArrayContains(supportedExtImageInfo.hContainer, TWTY_UINT16, TWEI_CAMERA) ||
+         !ArrayContains(supportedExtImageInfo.hContainer, TWTY_UINT16, TWEI_FRAMENUMBER) ||
+         !ArrayContains(supportedExtImageInfo.hContainer, TWTY_UINT16, TWEI_PAGESIDE) ||
+         !ArrayContains(supportedExtImageInfo.hContainer, TWTY_UINT16, TWEI_PAPERCOUNT)))
+    {
+        std::printf("ICAP_SUPPORTEDEXTIMAGEINFO/MSG_GET: missing expected TWEI values\n");
+        ++failures;
+    }
+    FreeContainer(supportedExtImageInfo);
 
     TW_CAPABILITY querySupport{};
     querySupport.Cap = ICAP_XFERMECH;
@@ -1046,6 +1130,67 @@ int wmain(int argc, wchar_t** argv)
                             imageInfo.YResolution.Whole,
                             imageInfo.YResolution.Frac);
                         ++failures;
+                    }
+
+                    struct ExtImageInfoRequest
+                    {
+                        TW_UINT32 NumInfos;
+                        TW_INFO Info[6];
+                    };
+
+                    ExtImageInfoRequest extImageInfo{};
+                    extImageInfo.NumInfos = 6;
+                    extImageInfo.Info[0].InfoID = TWEI_DOCUMENTNUMBER;
+                    extImageInfo.Info[1].InfoID = TWEI_PAGENUMBER;
+                    extImageInfo.Info[2].InfoID = TWEI_CAMERA;
+                    extImageInfo.Info[3].InfoID = TWEI_FRAMENUMBER;
+                    extImageInfo.Info[4].InfoID = TWEI_PAGESIDE;
+                    extImageInfo.Info[5].InfoID = TWEI_PAPERCOUNT;
+                    char extImageInfoLabel[72] = {};
+                    std::snprintf(
+                        extImageInfoLabel,
+                        sizeof(extImageInfoLabel),
+                        "DAT_EXTIMAGEINFO/MSG_GET #%u",
+                        static_cast<unsigned>(transferIndex + 1));
+                    const int extInfoFailures = ExpectSuccess(
+                        extImageInfoLabel,
+                        entry(&app, DG_IMAGE, DAT_EXTIMAGEINFO, MSG_GET, &extImageInfo));
+                    failures += extInfoFailures;
+                    if (extInfoFailures == 0)
+                    {
+                        const TW_UINT32 expectedPaperNumber = (transferIndex / 2U) + 1U;
+                        const TW_UINT16 expectedPageSide = (transferIndex % 2U) == 1U ? TWCS_BOTTOM : TWCS_TOP;
+                        const TW_UINT32 expectedPaperCount = (expectedTransferTotal + 1U) / 2U;
+                        failures += ExpectExtInfoUInt32(
+                            "DAT_EXTIMAGEINFO DocumentNumber",
+                            extImageInfo.Info[0],
+                            TWEI_DOCUMENTNUMBER,
+                            1);
+                        failures += ExpectExtInfoUInt32(
+                            "DAT_EXTIMAGEINFO PageNumber",
+                            extImageInfo.Info[1],
+                            TWEI_PAGENUMBER,
+                            expectedPaperNumber);
+                        failures += ExpectExtInfoUInt16(
+                            "DAT_EXTIMAGEINFO Camera",
+                            extImageInfo.Info[2],
+                            TWEI_CAMERA,
+                            expectedPageSide);
+                        failures += ExpectExtInfoUInt32(
+                            "DAT_EXTIMAGEINFO FrameNumber",
+                            extImageInfo.Info[3],
+                            TWEI_FRAMENUMBER,
+                            transferIndex + 1U);
+                        failures += ExpectExtInfoUInt16(
+                            "DAT_EXTIMAGEINFO PageSide",
+                            extImageInfo.Info[4],
+                            TWEI_PAGESIDE,
+                            expectedPageSide);
+                        failures += ExpectExtInfoUInt32(
+                            "DAT_EXTIMAGEINFO PaperCount",
+                            extImageInfo.Info[5],
+                            TWEI_PAPERCOUNT,
+                            expectedPaperCount);
                     }
 
                     TW_HANDLE dib = nullptr;

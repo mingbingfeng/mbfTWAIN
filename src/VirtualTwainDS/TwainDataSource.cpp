@@ -174,6 +174,30 @@ std::uint32_t Fix32WholeOrDefault(TW_FIX32 value, std::uint32_t fallback) noexce
     return fallback;
 }
 
+void SetExtInfoUnsupported(TW_INFO& info) noexcept
+{
+    info.ItemType = TWTY_UINT16;
+    info.NumItems = 0;
+    info.ReturnCode = TWRC_INFONOTSUPPORTED;
+    info.Item = 0;
+}
+
+void SetExtInfoUInt16(TW_INFO& info, TW_UINT16 value) noexcept
+{
+    info.ItemType = TWTY_UINT16;
+    info.NumItems = 1;
+    info.ReturnCode = TWRC_SUCCESS;
+    info.Item = value;
+}
+
+void SetExtInfoUInt32(TW_INFO& info, TW_UINT32 value) noexcept
+{
+    info.ItemType = TWTY_UINT32;
+    info.NumItems = 1;
+    info.ReturnCode = TWRC_SUCCESS;
+    info.Item = value;
+}
+
 bool FileExists(const std::wstring& path) noexcept
 {
     return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -417,6 +441,8 @@ std::wstring DataArgumentTypeName(TW_UINT16 dataArgumentType)
         return L"DAT_ENTRYPOINT";
     case DAT_IMAGEINFO:
         return L"DAT_IMAGEINFO";
+    case DAT_EXTIMAGEINFO:
+        return L"DAT_EXTIMAGEINFO";
     case DAT_IMAGENATIVEXFER:
         return L"DAT_IMAGENATIVEXFER";
     case DAT_IMAGEMEMXFER:
@@ -923,6 +949,7 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(
             return Fail(TWCC_SEQERROR);
         }
 
+        CompleteTransferIfUiStopped(lock);
         pendingTransfers->Count = transferSession_.RemainingImageCountForTwain();
         pendingTransfers->EOJ = 0;
         return Succeed();
@@ -935,6 +962,7 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(
             return Fail(TWCC_SEQERROR);
         }
 
+        CompleteTransferIfUiStopped(lock);
         const TW_UINT32 remaining = transferSession_.RemainingImageCount();
         pendingTransfers->Count = transferSession_.RemainingImageCountForTwain();
         pendingTransfers->EOJ = 0;
@@ -1037,6 +1065,8 @@ TW_UINT16 VirtualTwainDataSource::HandleImage(
     {
     case DAT_IMAGEINFO:
         return HandleImageInfo(message, data, lock);
+    case DAT_EXTIMAGEINFO:
+        return HandleExtendedImageInfo(message, data);
     case DAT_IMAGENATIVEXFER:
         return HandleImageNativeTransfer(message, data, lock);
     case DAT_IMAGEMEMXFER:
@@ -1076,6 +1106,33 @@ TW_UINT16 VirtualTwainDataSource::HandleImageInfo(
     return Succeed();
 }
 
+TW_UINT16 VirtualTwainDataSource::HandleExtendedImageInfo(TW_UINT16 message, TW_MEMREF data)
+{
+    if (message != MSG_GET)
+    {
+        return Fail(TWCC_BADPROTOCOL);
+    }
+    if (!IsAtLeast(TwainState::TransferReady))
+    {
+        return Fail(TWCC_SEQERROR);
+    }
+
+    auto* extendedImageInfo = static_cast<pTW_EXTIMAGEINFO>(data);
+    if (extendedImageInfo == nullptr)
+    {
+        return Fail(TWCC_BADVALUE);
+    }
+
+    TW_UINT32 imageIndex = 0;
+    if (!TryResolveImageInfoIndex(imageIndex) ||
+        !FillExtendedImageInfo(imageIndex, extendedImageInfo))
+    {
+        return Fail(TWCC_OPERATIONERROR);
+    }
+
+    return Succeed();
+}
+
 TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(
     TW_UINT16 message,
     TW_MEMREF data,
@@ -1100,12 +1157,31 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(
         return Fail(TWCC_BADVALUE);
     }
 
+    if (CompleteTransferIfUiStopped(lock))
+    {
+        *outputHandle = nullptr;
+        lastStatus_.ConditionCode = TWCC_SUCCESS;
+        lastStatus_.Data = 0;
+        return TWRC_CANCEL;
+    }
+
     DecodedImageInfo decodedInfo{};
     const TW_UINT32 imageIndex = transferSession_.PendingImageIndex();
     const ScannerIpcImage selectedImage = transferSession_.PendingImage();
     const TW_UINT16 pixelType = capabilities_.PixelType();
     const std::uint32_t xResolution = Fix32WholeOrDefault(capabilities_.XResolution(), 300);
     const std::uint32_t yResolution = Fix32WholeOrDefault(capabilities_.YResolution(), 300);
+
+    ReportTransferProgress(lock, imageIndex);
+    if (state_ != TwainState::TransferReady ||
+        transferSession_.PendingImageIndex() != imageIndex ||
+        !transferSession_.MatchesImage(imageIndex, selectedImage) ||
+        capabilities_.PixelType() != pixelType ||
+        Fix32WholeOrDefault(capabilities_.XResolution(), 300) != xResolution ||
+        Fix32WholeOrDefault(capabilities_.YResolution(), 300) != yResolution)
+    {
+        return Fail(TWCC_SEQERROR);
+    }
 
     lock.unlock();
     TW_HANDLE dib = ImageDib::BuildNativeDib(
@@ -1138,6 +1214,9 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(
     transferSession_.MarkCurrentImage(imageIndex);
     state_ = TwainState::Transferring;
     transferReady_ = transferSession_.HasPendingImage();
+    ReportTransferProgress(lock, imageIndex + 1U);
+    ApplyTransferBufferDelay(lock);
+    LimitTransferToCurrentImageIfUiStopped(lock, imageIndex);
     HideScanUiIfTransferStarted(lock);
     lastStatus_.ConditionCode = TWCC_SUCCESS;
     lastStatus_.Data = 0;
@@ -1164,9 +1243,36 @@ TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(
         return Fail(TWCC_BADVALUE);
     }
 
+    if (CompleteTransferIfUiStopped(lock))
+    {
+        transfer->Compression = TWCP_NONE;
+        transfer->BytesPerRow = 0;
+        transfer->Columns = 0;
+        transfer->Rows = 0;
+        transfer->XOffset = 0;
+        transfer->YOffset = 0;
+        transfer->BytesWritten = 0;
+        lastStatus_.ConditionCode = TWCC_SUCCESS;
+        lastStatus_.Data = 0;
+        return TWRC_CANCEL;
+    }
+
     if (!EnsureMemoryTransferReady(lock))
     {
         return Fail(TWCC_OPERATIONERROR);
+    }
+
+    if (transferSession_.MemoryNextRow() == 0)
+    {
+        ReportTransferProgress(lock, transferSession_.PendingImageIndex());
+        if (state_ != TwainState::TransferReady && state_ != TwainState::Transferring)
+        {
+            return Fail(TWCC_SEQERROR);
+        }
+        if (!transferSession_.HasMemoryForPendingImage())
+        {
+            return Fail(TWCC_OPERATIONERROR);
+        }
     }
 
     BYTE* destination = nullptr;
@@ -1216,13 +1322,19 @@ TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(
 
     if (transferSession_.MemoryComplete())
     {
+        const TW_UINT32 completedImageCount = transferSession_.MemoryImageIndex() + 1U;
         transferSession_.AdvancePendingImage();
         transferReady_ = transferSession_.HasPendingImage();
         ResetMemoryTransfer();
+        ReportTransferProgress(lock, completedImageCount);
+        ApplyTransferBufferDelay(lock);
+        LimitTransferToCurrentImageIfUiStopped(lock, completedImageCount - 1U);
         HideScanUiIfTransferStarted(lock);
         return TWRC_XFERDONE;
     }
 
+    ApplyTransferBufferDelay(lock);
+    LimitTransferToCurrentImageIfUiStopped(lock, transferSession_.MemoryImageIndex());
     return TWRC_SUCCESS;
 }
 
@@ -1310,7 +1422,8 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc(std::unique_lock<std::m
             L" pixel=" + ipcState.pixelType +
             L" paper=" + ipcState.paperSize +
             L" xres=" + std::to_wstring(ipcState.xResolution) +
-            L" yres=" + std::to_wstring(ipcState.yResolution));
+            L" yres=" + std::to_wstring(ipcState.yResolution) +
+            L" transferDelayMs=" + std::to_wstring(ipcState.transferBufferDelayMilliseconds));
 
     lock.lock();
     if (!IsAtLeast(TwainState::SourceEnabled))
@@ -1359,9 +1472,13 @@ void VirtualTwainDataSource::ApplyScannerSettingsFromIpc(const ScannerIpcState& 
 void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcState)
 {
     const std::uint32_t revision = ipcState.revision;
+    const std::uint32_t transferBufferDelayMilliseconds = ipcState.transferBufferDelayMilliseconds;
     ipcSession_.ResetUiFlow();
     transferReadyNotified_ = false;
-    transferSession_.Begin(revision, std::move(ipcState.selectedImages));
+    transferSession_.Begin(
+        revision,
+        std::move(ipcState.selectedImages),
+        transferBufferDelayMilliseconds);
     if (capabilities_.TransferCount() > 0)
     {
         const size_t requestedImageCount = static_cast<size_t>(capabilities_.TransferCount());
@@ -1380,6 +1497,7 @@ void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcSta
         L"DS",
         L"Transfer ready from IPC revision=" + std::to_wstring(transferSession_.Revision()) +
             L" imageCount=" + std::to_wstring(transferSession_.ImageCount()) +
+            L" transferDelayMs=" + std::to_wstring(transferSession_.TransferBufferDelayMilliseconds()) +
             L" xferCount=" + std::to_wstring(capabilities_.TransferCount()));
 }
 
@@ -1859,6 +1977,51 @@ bool VirtualTwainDataSource::FillImageInfo(
     return true;
 }
 
+bool VirtualTwainDataSource::FillExtendedImageInfo(
+    TW_UINT32 imageIndex,
+    pTW_EXTIMAGEINFO extendedImageInfo) const noexcept
+{
+    if (extendedImageInfo == nullptr || imageIndex >= transferSession_.ImageCount())
+    {
+        return false;
+    }
+
+    const bool duplex = capabilities_.DuplexEnabled() != FALSE;
+    const TW_UINT32 imageCount = static_cast<TW_UINT32>(transferSession_.ImageCount());
+    const TW_UINT32 paperNumber = duplex ? (imageIndex / 2U) + 1U : imageIndex + 1U;
+    const TW_UINT32 paperCount = duplex ? (imageCount + 1U) / 2U : imageCount;
+    const TW_UINT16 pageSide = duplex && (imageIndex % 2U) == 1U ? TWCS_BOTTOM : TWCS_TOP;
+
+    for (TW_UINT32 index = 0; index < extendedImageInfo->NumInfos; ++index)
+    {
+        TW_INFO& info = extendedImageInfo->Info[index];
+        switch (info.InfoID)
+        {
+        case TWEI_DOCUMENTNUMBER:
+            SetExtInfoUInt32(info, 1);
+            break;
+        case TWEI_PAGENUMBER:
+            SetExtInfoUInt32(info, paperNumber);
+            break;
+        case TWEI_CAMERA:
+        case TWEI_PAGESIDE:
+            SetExtInfoUInt16(info, pageSide);
+            break;
+        case TWEI_FRAMENUMBER:
+            SetExtInfoUInt32(info, imageIndex + 1U);
+            break;
+        case TWEI_PAPERCOUNT:
+            SetExtInfoUInt32(info, paperCount);
+            break;
+        default:
+            SetExtInfoUnsupported(info);
+            break;
+        }
+    }
+
+    return true;
+}
+
 bool VirtualTwainDataSource::EnsureMemoryTransferReady(std::unique_lock<std::mutex>& lock)
 {
     if (!transferSession_.HasPendingImage())
@@ -1904,6 +2067,111 @@ bool VirtualTwainDataSource::EnsureMemoryTransferReady(std::unique_lock<std::mut
 void VirtualTwainDataSource::ResetMemoryTransfer() noexcept
 {
     transferSession_.ResetMemory();
+}
+
+bool VirtualTwainDataSource::IsUiStopRequested(std::unique_lock<std::mutex>& lock)
+{
+    if (!transferSession_.HasRevision())
+    {
+        return false;
+    }
+
+    const std::uint32_t revision = transferSession_.Revision();
+    ScannerIpcState ipcState{};
+    ScannerIpcClient client;
+    lock.unlock();
+    const bool gotState = client.TryGetState(ipcState, 30);
+    lock.lock();
+
+    if (!gotState ||
+        !transferSession_.HasRevision() ||
+        transferSession_.Revision() != revision)
+    {
+        return false;
+    }
+
+    return !ipcState.scanRequested;
+}
+
+bool VirtualTwainDataSource::CompleteTransferIfUiStopped(std::unique_lock<std::mutex>& lock)
+{
+    if (!IsUiStopRequested(lock))
+    {
+        return false;
+    }
+
+    diagnostics::AppendLine(
+        L"DS",
+        L"UI requested scan stop; completing transfer session revision=" +
+            std::to_wstring(transferSession_.Revision()));
+    transferReady_ = false;
+    transferReadyNotified_ = false;
+    transferSession_.DiscardImages();
+    ResetMemoryTransfer();
+    return true;
+}
+
+bool VirtualTwainDataSource::LimitTransferToCurrentImageIfUiStopped(
+    std::unique_lock<std::mutex>& lock,
+    TW_UINT32 imageIndex)
+{
+    if (!IsUiStopRequested(lock))
+    {
+        return false;
+    }
+
+    const size_t keepImageCount = (std::min)(
+        static_cast<size_t>(imageIndex) + 1U,
+        transferSession_.ImageCount());
+    diagnostics::AppendLine(
+        L"DS",
+        L"UI requested scan stop; trimming remaining images revision=" +
+            std::to_wstring(transferSession_.Revision()) +
+            L" keep=" + std::to_wstring(keepImageCount) +
+            L" available=" + std::to_wstring(transferSession_.ImageCount()));
+    transferSession_.LimitImages(keepImageCount);
+    transferReady_ = transferSession_.HasPendingImage();
+    transferReadyNotified_ = false;
+    return true;
+}
+
+void VirtualTwainDataSource::ReportTransferProgress(
+    std::unique_lock<std::mutex>& lock,
+    TW_UINT32 completedImages)
+{
+    if (!transferSession_.HasRevision() || transferSession_.ImageCount() == 0)
+    {
+        return;
+    }
+
+    const std::uint32_t revision = transferSession_.Revision();
+    const TW_UINT32 totalImages = static_cast<TW_UINT32>(
+        (std::min)(transferSession_.ImageCount(), static_cast<size_t>(0xffffffffU)));
+    const TW_UINT32 boundedCompleted = (std::min)(completedImages, totalImages);
+
+    ScannerIpcClient client;
+    lock.unlock();
+    const bool reported = client.ReportTransferProgress(revision, boundedCompleted, totalImages, 30);
+    diagnostics::AppendLine(
+        L"DS",
+        L"TransferProgress revision=" + std::to_wstring(revision) +
+            L" completed=" + std::to_wstring(boundedCompleted) +
+            L" total=" + std::to_wstring(totalImages) +
+            L" success=" + std::to_wstring(reported ? 1U : 0U));
+    lock.lock();
+}
+
+void VirtualTwainDataSource::ApplyTransferBufferDelay(std::unique_lock<std::mutex>& lock)
+{
+    const std::uint32_t delayMilliseconds = transferSession_.TransferBufferDelayMilliseconds();
+    if (delayMilliseconds == 0)
+    {
+        return;
+    }
+
+    lock.unlock();
+    std::this_thread::sleep_for(std::chrono::milliseconds(delayMilliseconds));
+    lock.lock();
 }
 
 void VirtualTwainDataSource::HideScanUiSession(std::unique_lock<std::mutex>& lock)
@@ -2005,7 +2273,7 @@ TW_IDENTITY VirtualTwainDataSource::BuildSourceIdentity() noexcept
     identity.Version.MinorNum = 0;
     identity.Version.Language = TWLG_ENGLISH_USA;
     identity.Version.Country = TWCY_USA;
-    CopyTwainString(identity.Version.Info, sizeof(identity.Version.Info), "mbfTwain 1.0.1");
+    CopyTwainString(identity.Version.Info, sizeof(identity.Version.Info), "mbfTwain 1.0.2");
 
     identity.ProtocolMajor = TWON_PROTOCOLMAJOR;
     identity.ProtocolMinor = TWON_PROTOCOLMINOR;
