@@ -1,5 +1,7 @@
 param(
     [string]$Configuration = "Release",
+    [string]$Version = "",
+    [switch]$BuildOnly,
     [switch]$SkipSmoke,
     [switch]$NoForceUi
 )
@@ -58,6 +60,25 @@ function Invoke-WithTemporaryEnvironment([hashtable]$Variables, [scriptblock]$Ac
             [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
         }
     }
+}
+
+function Get-DotNetVersionArguments {
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        return @()
+    }
+
+    if ($Version -notmatch '^\d+\.\d+\.\d+([\-+].*)?$') {
+        throw "Version must use semantic version format, for example 1.0.0. Actual: $Version"
+    }
+
+    $baseVersion = ($Version -split '[-+]')[0]
+    $assemblyVersion = "$baseVersion.0"
+    return @(
+        "/p:Version=$Version",
+        "/p:AssemblyVersion=$assemblyVersion",
+        "/p:FileVersion=$assemblyVersion",
+        "/p:InformationalVersion=$Version"
+    )
 }
 
 function Get-VsWherePath {
@@ -177,7 +198,8 @@ function Get-Vs18MsvcToolRoot {
 
 function Build-Managed {
     Write-Step "Building managed tools"
-    dotnet build $UiProject -c $Configuration
+    [string[]]$versionArgs = @(Get-DotNetVersionArguments)
+    dotnet build $UiProject -c $Configuration @versionArgs
     if ($LASTEXITCODE -ne 0) {
         throw "VirtualScannerConfig build failed with exit code $LASTEXITCODE"
     }
@@ -548,6 +570,15 @@ try {
         Run-UiCloseWithoutSelectionSmoke "Win32"
         Run-UiXferCountSmoke "x64"
         Run-UiXferCountSmoke "Win32"
+    }
+
+    if ($BuildOnly) {
+        Write-Step "Build output ready"
+        Get-ChildItem (Join-Path $Root "build\manual\Win32\$Configuration"), (Join-Path $Root "build\manual\x64\$Configuration") -File |
+            Where-Object { $_.Name -like "mbfVirtualTwainDS.*" -or $_.Name -like "mbfTwain.VirtualScannerConfig.*" } |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+        return
     }
 
     Install-LocalTwain

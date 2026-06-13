@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -7,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 using MbfTwain.VirtualScannerConfig.Ipc;
+using MbfTwain.VirtualScannerConfig.Updates;
 
 namespace MbfTwain.VirtualScannerConfig;
 
@@ -25,6 +28,7 @@ public sealed class MainForm : Form
     private readonly object stateLock = new();
     private readonly List<ScannerImageSelection> selectedImages = [];
     private readonly ScannerPipeServer pipeServer;
+    private readonly GitHubUpdateService updateService = new();
 
     private uint revision;
     private bool scanRequested;
@@ -33,6 +37,7 @@ public sealed class MainForm : Form
     private string paperSize = "A4";
     private int scanDpi = 300;
     private int selectedImageIndex = -1;
+    private ReleaseUpdateInfo? latestRelease;
 
     private readonly FlowLayoutPanel thumbnailStrip = new();
     private readonly LinkLabel clearImagesLink = new();
@@ -54,6 +59,7 @@ public sealed class MainForm : Form
         UpdateSettingsSummary();
         pipeServer.Start();
         RefreshQueueVisuals();
+        _ = CheckForUpdatesSilentlyAsync();
         DiagnosticsLog.Write("UI", "MainForm initialized");
     }
 
@@ -287,6 +293,40 @@ public sealed class MainForm : Form
         clearImagesLink.LinkClicked += (_, _) => ClearImages();
     }
 
+    private async Task CheckForUpdatesSilentlyAsync()
+    {
+        try
+        {
+            ReleaseUpdateInfo release = await updateService.GetLatestReleaseAsync(CancellationToken.None);
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            void Apply()
+            {
+                latestRelease = release;
+                if (release.IsNewer)
+                {
+                    UpdateStatus();
+                }
+            }
+
+            if (InvokeRequired && IsHandleCreated)
+            {
+                BeginInvoke((MethodInvoker)Apply);
+            }
+            else
+            {
+                Apply();
+            }
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.WriteException("UI", exception, "Silent update check");
+        }
+    }
+
     private void ShowSettingsDialog()
     {
         bool currentDuplex;
@@ -309,7 +349,7 @@ public sealed class MainForm : Form
             MinimizeBox = false,
             MaximizeBox = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(280, 230),
+            ClientSize = new Size(380, 320),
             BackColor = SurfaceBackground,
         };
 
@@ -317,13 +357,13 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
-            RowCount = 5,
+            RowCount = 6,
             Padding = new Padding(16),
             BackColor = SurfaceBackground,
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int row = 0; row < 4; row++)
+        for (int row = 0; row < 5; row++)
         {
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         }
@@ -346,6 +386,9 @@ public sealed class MainForm : Form
         AddSettingsDialogRow(layout, "DPI", dpiInput, 2);
         layout.Controls.Add(new Label { AutoSize = true, Text = string.Empty, Margin = new Padding(0) }, 0, 3);
         layout.Controls.Add(duplexInput, 1, 3);
+        Control updatePanel = BuildUpdateSettingsPanel(dialog);
+        layout.Controls.Add(updatePanel, 0, 4);
+        layout.SetColumnSpan(updatePanel, 2);
 
         var buttons = new FlowLayoutPanel
         {
@@ -358,7 +401,7 @@ public sealed class MainForm : Form
         var cancelButton = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Width = 76 };
         buttons.Controls.Add(okButton);
         buttons.Controls.Add(cancelButton);
-        layout.Controls.Add(buttons, 0, 4);
+        layout.Controls.Add(buttons, 0, 5);
         layout.SetColumnSpan(buttons, 2);
 
         dialog.AcceptButton = okButton;
@@ -375,6 +418,156 @@ public sealed class MainForm : Form
             pixelInput.SelectedItem?.ToString() ?? "RGB",
             paperInput.SelectedItem?.ToString() ?? "A4",
             Convert.ToInt32(dpiInput.SelectedItem ?? 300));
+    }
+
+    private Control BuildUpdateSettingsPanel(IWin32Window owner)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            RowCount = 2,
+            AutoSize = true,
+            Margin = new Padding(0, 12, 0, 0),
+            BackColor = SurfaceBackground,
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var versionLabel = new Label
+        {
+            AutoSize = true,
+            Text = $"当前版本 {updateService.CurrentVersionText}",
+            Anchor = AnchorStyles.Left,
+            ForeColor = Color.FromArgb(49, 58, 52),
+            Margin = new Padding(0, 2, 8, 4),
+        };
+        panel.Controls.Add(versionLabel, 0, 0);
+
+        var updateButton = new Button
+        {
+            Text = "检查更新",
+            Width = 92,
+            Height = 28,
+            Anchor = AnchorStyles.Right,
+            Margin = new Padding(8, 0, 0, 4),
+        };
+        panel.Controls.Add(updateButton, 1, 0);
+
+        var updateStatus = new Label
+        {
+            AutoSize = false,
+            Dock = DockStyle.Top,
+            Height = 36,
+            Text = GetUpdateStatusText(),
+            ForeColor = MutedTextColor,
+            Margin = new Padding(0, 0, 0, 0),
+        };
+        panel.Controls.Add(updateStatus, 0, 1);
+        panel.SetColumnSpan(updateStatus, 2);
+
+        updateButton.Click += async (_, _) =>
+        {
+            await RunUpdateFromSettingsAsync(owner, updateStatus, updateButton);
+        };
+
+        return panel;
+    }
+
+    private string GetUpdateStatusText()
+    {
+        return latestRelease switch
+        {
+            { IsNewer: true } release => $"发现新版本 {release.TagName}",
+            { } release => $"已检查，最新发布 {release.TagName}",
+            _ => "从 GitHub Releases 检查安装包更新。",
+        };
+    }
+
+    private async Task RunUpdateFromSettingsAsync(IWin32Window owner, Label updateStatus, Button updateButton)
+    {
+        updateButton.Enabled = false;
+        try
+        {
+            updateStatus.Text = "正在检查 GitHub Releases...";
+            ReleaseUpdateInfo release = await updateService.GetLatestReleaseAsync(CancellationToken.None);
+            latestRelease = release;
+            UpdateStatus();
+
+            if (!release.IsNewer)
+            {
+                updateStatus.Text = $"已是最新版本 {updateService.CurrentVersionText}";
+                MessageBox.Show(owner, "当前已经是最新版本。", "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (release.InstallerUri is null)
+            {
+                updateStatus.Text = $"发现 {release.TagName}，但没有安装包。";
+                MessageBox.Show(owner, "最新 GitHub Release 没有可下载的安装包。", "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            updateStatus.Text = $"发现新版本 {release.TagName}";
+            DialogResult answer = MessageBox.Show(
+                owner,
+                $"发现新版本 {release.TagName}。\r\n当前版本 {updateService.CurrentVersionText}。\r\n\r\n是否下载并启动安装程序？",
+                "检查更新",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information);
+            if (answer != DialogResult.Yes)
+            {
+                updateStatus.Text = "已取消更新。";
+                return;
+            }
+
+            var progress = new Progress<DownloadProgress>(progressValue =>
+            {
+                if (!updateStatus.IsDisposed)
+                {
+                    updateStatus.Text = $"正在下载 {progressValue.ToDisplayText()}";
+                }
+            });
+            string installerPath = await updateService.DownloadInstallerAsync(release, progress, CancellationToken.None);
+            updateStatus.Text = "下载完成，正在启动安装程序...";
+            LaunchInstallerElevated(installerPath);
+            updateStatus.Text = "安装程序已启动，请按提示完成安装。";
+        }
+        catch (Win32Exception exception) when (exception.NativeErrorCode == 1223)
+        {
+            updateStatus.Text = "已取消管理员授权。";
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.WriteException("UI", exception, "Update from settings");
+            updateStatus.Text = "更新失败，请稍后重试。";
+            MessageBox.Show(owner, exception.Message, "更新失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            if (!updateButton.IsDisposed)
+            {
+                updateButton.Enabled = true;
+            }
+        }
+    }
+
+    private static void LaunchInstallerElevated(string installerPath)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = installerPath,
+            UseShellExecute = true,
+            Verb = "runas",
+        };
+
+        Process? process = Process.Start(startInfo);
+        if (process is null)
+        {
+            throw new InvalidOperationException("无法启动安装程序。");
+        }
     }
 
     private static ComboBox BuildSettingsCombo(object[] items, object selected)
@@ -1084,8 +1277,11 @@ public sealed class MainForm : Form
         string activeText = snapshot.SelectedImages.Count == 0 || activePage <= 0
             ? "未选中页面"
             : $"当前第 {activePage}/{snapshot.SelectedImages.Count} 页";
+        string updateText = latestRelease is { IsNewer: true } release
+            ? $" | 新版本 {release.TagName}"
+            : string.Empty;
         statusLabel.Text =
-            $"{scanState} | 队列 {snapshot.SelectedImages.Count} | {activeText} | {snapshot.PixelType} | {snapshot.PaperSize} | {snapshot.XResolution}x{snapshot.YResolution} DPI | 管道 {ScannerPipeServer.PipeName}";
+            $"{scanState} | 队列 {snapshot.SelectedImages.Count} | {activeText} | {snapshot.PixelType} | {snapshot.PaperSize} | {snapshot.XResolution}x{snapshot.YResolution} DPI | 管道 {ScannerPipeServer.PipeName}{updateText}";
     }
 
     private static int NormalizeRotationDegrees(int rotationDegrees)

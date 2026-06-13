@@ -101,3 +101,37 @@ For an installed TWAIN source, copy the `.ds` file and the
 `mbfTwain.VirtualScannerConfig.*` runtime files into the same TWAIN source
 directory, or set `MBF_TWAIN_UI_EXE` to the full path of
 `mbfTwain.VirtualScannerConfig.exe`.
+
+## Release Packaging
+
+Build and package a release installer with the local Inno Setup 6 installation:
+
+```powershell
+.\tools\Build-Release.ps1 -Version 1.0.0 -InnoSetupPath "D:\Program Files (x86)\Inno Setup 6"
+```
+
+The script reuses `Install-LocalTwain.ps1` in build-only mode, stages both
+Win32 and x64 TWAIN source builds, runs the smoke tests unless `-SkipSmoke` is
+passed, then writes:
+
+```text
+build\release\mbfTwain-Setup-v<version>.exe
+build\release\mbfTwain-Setup-v<version>.exe.sha256
+```
+
+Publish the committed build to GitHub Releases after packaging:
+
+```powershell
+.\tools\Publish-GitHubRelease.ps1 -Version 1.0.0
+```
+
+The installer copies the DS and UI runtime files into `C:\Windows\twain_32`
+and `C:\Windows\twain_64`, and sets the machine environment variable
+`MBF_TWAIN_FORCE_UI=1`.
+
+## Updates
+
+The configuration UI checks `https://api.github.com/repos/mingbingfeng/mbfTWAIN/releases/latest`
+for the newest GitHub Release. The settings dialog contains a **检查更新** button
+that downloads the release installer asset matching `*Setup*.exe` to the user's
+temporary update directory, then starts it with UAC elevation.

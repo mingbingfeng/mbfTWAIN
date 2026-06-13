@@ -2553,11 +2553,11 @@ TW_IDENTITY VirtualTwainDataSource::BuildSourceIdentity() noexcept
     TW_IDENTITY identity{};
 
     identity.Id = 0;
-    identity.Version.MajorNum = 0;
-    identity.Version.MinorNum = 2;
+    identity.Version.MajorNum = 1;
+    identity.Version.MinorNum = 0;
     identity.Version.Language = TWLG_ENGLISH_USA;
     identity.Version.Country = TWCY_USA;
-    CopyTwainString(identity.Version.Info, sizeof(identity.Version.Info), "mbfTwain Phase 2");
+    CopyTwainString(identity.Version.Info, sizeof(identity.Version.Info), "mbfTwain 1.0.0");
 
     identity.ProtocolMajor = TWON_PROTOCOLMAJOR;
     identity.ProtocolMinor = TWON_PROTOCOLMINOR;
