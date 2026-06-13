@@ -7,6 +7,8 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using MbfTwain.VirtualScannerConfig.Ipc;
 using MbfTwain.VirtualScannerConfig.Updates;
@@ -24,12 +26,20 @@ public sealed class MainForm : Form
     private static readonly string[] PixelTypeOptions = ["BW", "GRAY", "RGB"];
     private static readonly string[] PaperSizeOptions = ["A4", "A3"];
     private static readonly int[] DpiOptions = [150, 200, 300, 600];
+    private static readonly Size ThumbnailImageSize = new(172, 172);
+    private const int MaxThumbnailSourcePixels = 1_048_576;
+    private const int MaxPreviewImagePixels = 16_777_216;
+    private const int ThumbnailCacheLimit = 128;
 
     private readonly object stateLock = new();
+    private readonly object thumbnailCacheLock = new();
     private readonly List<ScannerImageSelection> selectedImages = [];
+    private readonly Dictionary<ThumbnailCacheKey, Bitmap> thumbnailCache = [];
+    private readonly Queue<ThumbnailCacheKey> thumbnailCacheOrder = [];
     private readonly ScannerPipeServer pipeServer;
     private readonly GitHubUpdateService updateService = new();
     private readonly CancellationTokenSource updateCancellation = new();
+    private CancellationTokenSource thumbnailLoadCancellation = new();
 
     private uint revision;
     private bool scanRequested;
@@ -46,6 +56,7 @@ public sealed class MainForm : Form
     private readonly Button settingsButton = new();
     private readonly Label statusLabel = new();
     private readonly ToolTip toolTip = new();
+    private Button? addTileButton;
 
     public MainForm()
     {
@@ -69,12 +80,15 @@ public sealed class MainForm : Form
         if (disposing)
         {
             updateCancellation.Cancel();
+            thumbnailLoadCancellation.Cancel();
             foreach (Control control in thumbnailStrip.Controls)
             {
                 DisposeControlImages(control);
             }
 
+            DisposeThumbnailCache();
             pipeServer.Dispose();
+            thumbnailLoadCancellation.Dispose();
             updateCancellation.Dispose();
         }
 
@@ -669,11 +683,6 @@ public sealed class MainForm : Form
         {
             foreach (string fileName in dialog.FileNames.Select(Path.GetFullPath).Where(File.Exists))
             {
-                if (selectedImages.Any(existing => string.Equals(existing.Path, fileName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    continue;
-                }
-
                 selectedImages.Add(new ScannerImageSelection(fileName, 0));
                 addedCount++;
                 if (firstAddedIndex < 0)
@@ -1000,20 +1009,70 @@ public sealed class MainForm : Form
             activeIndex = selectedImageIndex;
         }
 
+        CancellationToken cancellationToken = RestartThumbnailLoads();
+        Button addButton = GetAddTileButton();
+
         thumbnailStrip.SuspendLayout();
-        foreach (Control control in thumbnailStrip.Controls)
+        try
         {
-            DisposeControlImages(control);
+            for (int index = 0; index < snapshot.Count; index++)
+            {
+                Control? existing = index < thumbnailStrip.Controls.Count ? thumbnailStrip.Controls[index] : null;
+                if (existing is Panel tile && tile.Tag is ThumbnailTileState state)
+                {
+                    UpdateThumbnailTile(tile, state, snapshot[index], index, index == activeIndex, cancellationToken);
+                    continue;
+                }
+
+                Control newTile = BuildThumbnailTile(snapshot[index], index, index == activeIndex, cancellationToken);
+                thumbnailStrip.Controls.Add(newTile);
+                thumbnailStrip.Controls.SetChildIndex(newTile, index);
+            }
+
+            for (int index = thumbnailStrip.Controls.Count - 1; index >= snapshot.Count; index--)
+            {
+                Control control = thumbnailStrip.Controls[index];
+                if (ReferenceEquals(control, addButton))
+                {
+                    continue;
+                }
+
+                thumbnailStrip.Controls.RemoveAt(index);
+                DisposeControlImages(control);
+                control.Dispose();
+            }
+
+            if (!thumbnailStrip.Controls.Contains(addButton))
+            {
+                thumbnailStrip.Controls.Add(addButton);
+            }
+
+            thumbnailStrip.Controls.SetChildIndex(addButton, snapshot.Count);
+        }
+        finally
+        {
+            thumbnailStrip.ResumeLayout();
+        }
+    }
+
+    private CancellationToken RestartThumbnailLoads()
+    {
+        CancellationTokenSource previous = thumbnailLoadCancellation;
+        thumbnailLoadCancellation = new CancellationTokenSource();
+        previous.Cancel();
+        previous.Dispose();
+        return thumbnailLoadCancellation.Token;
+    }
+
+    private Button GetAddTileButton()
+    {
+        if (addTileButton is not null)
+        {
+            return addTileButton;
         }
 
-        thumbnailStrip.Controls.Clear();
-        for (int index = 0; index < snapshot.Count; index++)
-        {
-            thumbnailStrip.Controls.Add(BuildThumbnailTile(snapshot[index], index, index == activeIndex));
-        }
-
-        thumbnailStrip.Controls.Add(BuildAddTileButton());
-        thumbnailStrip.ResumeLayout();
+        addTileButton = BuildAddTileButton();
+        return addTileButton;
     }
 
     private Button BuildAddTileButton()
@@ -1036,7 +1095,11 @@ public sealed class MainForm : Form
         return button;
     }
 
-    private Control BuildThumbnailTile(ScannerImageSelection image, int index, bool isSelected)
+    private Control BuildThumbnailTile(
+        ScannerImageSelection image,
+        int index,
+        bool isSelected,
+        CancellationToken cancellationToken)
     {
         var tile = new Panel
         {
@@ -1046,9 +1109,8 @@ public sealed class MainForm : Form
             Padding = new Padding(8),
             BackColor = isSelected ? AccentSoft : Color.White,
             Cursor = Cursors.Hand,
-            Tag = index,
         };
-        tile.DoubleClick += (_, _) => ShowFullscreenPreview(index);
+        tile.DoubleClick += (sender, _) => ShowFullscreenPreview(GetTileIndex((Control)sender!));
         tile.Paint += (_, args) => DrawThumbnailBorder(
             args.Graphics,
             tile.ClientRectangle,
@@ -1062,18 +1124,212 @@ public sealed class MainForm : Form
             BackColor = Color.FromArgb(248, 249, 244),
             Cursor = Cursors.Hand,
         };
-        thumbnail.Image = TryCreateThumbnail(image, new Size(172, 172));
-        thumbnail.DoubleClick += (_, _) => ShowFullscreenPreview(index);
+        thumbnail.DoubleClick += (sender, _) => ShowFullscreenPreview(GetTileIndex((Control)sender!));
         tile.Controls.Add(thumbnail);
 
+        var state = new ThumbnailTileState(thumbnail);
+        tile.Tag = state;
+        UpdateThumbnailTile(tile, state, image, index, isSelected, cancellationToken);
+
+        tile.Click += (sender, _) => SelectImage(GetTileIndex((Control)sender!));
+        thumbnail.Click += (sender, _) => SelectImage(GetTileIndex((Control)sender!));
+        return tile;
+    }
+
+    private void UpdateThumbnailTile(
+        Panel tile,
+        ThumbnailTileState state,
+        ScannerImageSelection image,
+        int index,
+        bool isSelected,
+        CancellationToken cancellationToken)
+    {
+        state.Image = image;
+        state.Index = index;
+        state.IsSelected = isSelected;
+
+        tile.BackColor = isSelected ? AccentSoft : Color.White;
         if (isSelected)
         {
             AddThumbnailActionControls(tile, index);
         }
+        else
+        {
+            RemoveThumbnailActionControls(tile);
+        }
 
-        tile.Click += (_, _) => SelectImage(index);
-        thumbnail.Click += (_, _) => SelectImage(index);
-        return tile;
+        EnsureThumbnailImage(state, image, ThumbnailImageSize, cancellationToken);
+        tile.Invalidate();
+    }
+
+    private static int GetTileIndex(Control control)
+    {
+        for (Control? current = control; current is not null; current = current.Parent)
+        {
+            if (current.Tag is ThumbnailTileState state)
+            {
+                return state.Index;
+            }
+        }
+
+        return -1;
+    }
+
+    private void EnsureThumbnailImage(
+        ThumbnailTileState state,
+        ScannerImageSelection image,
+        Size size,
+        CancellationToken cancellationToken)
+    {
+        if (!TryCreateThumbnailCacheKey(image, size, out ThumbnailCacheKey cacheKey))
+        {
+            state.ThumbnailKey = null;
+            state.HasLoadedThumbnail = true;
+            state.ThumbnailRequestId++;
+            ReplacePictureBoxImage(state.PictureBox, CreateFallbackThumbnail(size, "无法预览"));
+            return;
+        }
+
+        if (state.ThumbnailKey is ThumbnailCacheKey currentKey &&
+            currentKey.Equals(cacheKey) &&
+            state.HasLoadedThumbnail)
+        {
+            return;
+        }
+
+        state.ThumbnailKey = cacheKey;
+        state.HasLoadedThumbnail = false;
+        int requestId = ++state.ThumbnailRequestId;
+
+        Image? cached = TryCloneCachedThumbnail(cacheKey);
+        if (cached is not null)
+        {
+            state.HasLoadedThumbnail = true;
+            ReplacePictureBoxImage(state.PictureBox, cached);
+            return;
+        }
+
+        ReplacePictureBoxImage(state.PictureBox, CreateFallbackThumbnail(size, "加载中"));
+        Task<Bitmap> loadTask = Task.Run(() => CreateThumbnailForCache(image, size, cancellationToken));
+        _ = loadTask.ContinueWith(
+            task => CompleteThumbnailLoad(task, state, cacheKey, requestId, size, cancellationToken),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private void CompleteThumbnailLoad(
+        Task<Bitmap> task,
+        ThumbnailTileState state,
+        ThumbnailCacheKey cacheKey,
+        int requestId,
+        Size size,
+        CancellationToken cancellationToken)
+    {
+        bool failed = false;
+        if (task.Status == TaskStatus.RanToCompletion)
+        {
+            Bitmap thumbnail = task.Result;
+            if (cancellationToken.IsCancellationRequested)
+            {
+                thumbnail.Dispose();
+                return;
+            }
+
+            StoreCachedThumbnail(cacheKey, thumbnail);
+        }
+        else
+        {
+            failed = !task.IsCanceled && !cancellationToken.IsCancellationRequested;
+            if (task.IsFaulted)
+            {
+                _ = task.Exception;
+            }
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            BeginInvoke((MethodInvoker)(() =>
+                ApplyThumbnailLoadResult(state, cacheKey, requestId, size, failed)));
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    private void ApplyThumbnailLoadResult(
+        ThumbnailTileState state,
+        ThumbnailCacheKey cacheKey,
+        int requestId,
+        Size size,
+        bool failed)
+    {
+        if (IsDisposed ||
+            state.PictureBox.IsDisposed ||
+            state.ThumbnailRequestId != requestId ||
+            state.ThumbnailKey is not ThumbnailCacheKey currentKey ||
+            !currentKey.Equals(cacheKey))
+        {
+            return;
+        }
+
+        state.HasLoadedThumbnail = true;
+        Image thumbnail = failed
+            ? CreateFallbackThumbnail(size, "无法预览")
+            : TryCloneCachedThumbnail(cacheKey) ?? CreateFallbackThumbnail(size, "无法预览");
+        ReplacePictureBoxImage(state.PictureBox, thumbnail);
+    }
+
+    private Image? TryCloneCachedThumbnail(ThumbnailCacheKey cacheKey)
+    {
+        lock (thumbnailCacheLock)
+        {
+            return thumbnailCache.TryGetValue(cacheKey, out Bitmap? cached)
+                ? new Bitmap(cached)
+                : null;
+        }
+    }
+
+    private void StoreCachedThumbnail(ThumbnailCacheKey cacheKey, Bitmap thumbnail)
+    {
+        lock (thumbnailCacheLock)
+        {
+            if (thumbnailCache.ContainsKey(cacheKey))
+            {
+                thumbnail.Dispose();
+                return;
+            }
+
+            thumbnailCache.Add(cacheKey, thumbnail);
+            thumbnailCacheOrder.Enqueue(cacheKey);
+            while (thumbnailCache.Count > ThumbnailCacheLimit && thumbnailCacheOrder.Count > 0)
+            {
+                ThumbnailCacheKey oldestKey = thumbnailCacheOrder.Dequeue();
+                if (thumbnailCache.Remove(oldestKey, out Bitmap? oldestThumbnail))
+                {
+                    oldestThumbnail.Dispose();
+                }
+            }
+        }
+    }
+
+    private void DisposeThumbnailCache()
+    {
+        lock (thumbnailCacheLock)
+        {
+            foreach (Bitmap thumbnail in thumbnailCache.Values)
+            {
+                thumbnail.Dispose();
+            }
+
+            thumbnailCache.Clear();
+            thumbnailCacheOrder.Clear();
+        }
     }
 
     private void AddThumbnailActionControls(Panel tile, int index)
@@ -1226,6 +1482,12 @@ public sealed class MainForm : Form
 
         tile.SuspendLayout();
         tile.BackColor = isSelected ? AccentSoft : Color.White;
+        if (tile.Tag is ThumbnailTileState state)
+        {
+            state.Index = index;
+            state.IsSelected = isSelected;
+        }
+
         if (isSelected)
         {
             AddThumbnailActionControls(tile, index);
@@ -1340,28 +1602,103 @@ public sealed class MainForm : Form
         image?.Dispose();
     }
 
-    private static Image TryCreateThumbnail(ScannerImageSelection image, Size size)
+    private static void ReplacePictureBoxImage(PictureBox pictureBox, Image image)
+    {
+        Image? previous = pictureBox.Image;
+        pictureBox.Image = image;
+        previous?.Dispose();
+    }
+
+    private static bool TryCreateThumbnailCacheKey(
+        ScannerImageSelection image,
+        Size size,
+        out ThumbnailCacheKey cacheKey)
     {
         try
         {
-            using Bitmap bitmap = LoadPreparedImage(image.Path, image.RotationDegrees);
-            return RenderThumbnail(bitmap, size);
+            var file = new FileInfo(image.Path);
+            if (!file.Exists)
+            {
+                cacheKey = default;
+                return false;
+            }
+
+            cacheKey = new ThumbnailCacheKey(
+                Path.GetFullPath(file.FullName).ToUpperInvariant(),
+                file.LastWriteTimeUtc.Ticks,
+                file.Length,
+                NormalizeRotationDegrees(image.RotationDegrees),
+                size.Width,
+                size.Height);
+            return true;
         }
         catch
         {
-            return CreateFallbackThumbnail(size, "无法预览");
+            cacheKey = default;
+            return false;
         }
     }
 
     private static Bitmap LoadPreparedImage(string path, int rotationDegrees)
+        => LoadPreparedImage(path, rotationDegrees, MaxPreviewImagePixels);
+
+    private static Bitmap LoadPreparedImage(string path, int rotationDegrees, int maxPixels)
     {
-        byte[] bytes = File.ReadAllBytes(path);
-        using var memory = new MemoryStream(bytes);
-        using var source = Image.FromStream(memory, useEmbeddedColorManagement: true, validateImageData: true);
-        var bitmap = new Bitmap(source);
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var source = Image.FromStream(stream, useEmbeddedColorManagement: true, validateImageData: true);
+        using Bitmap scaled = CopyImageWithinPixelLimit(source, maxPixels);
+        var bitmap = new Bitmap(scaled);
         ApplyExifOrientation(bitmap);
         ApplyRotation(bitmap, rotationDegrees);
         return bitmap;
+    }
+
+    private static Bitmap CreateThumbnailForCache(
+        ScannerImageSelection image,
+        Size size,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using Bitmap bitmap = LoadPreparedImage(image.Path, image.RotationDegrees, MaxThumbnailSourcePixels);
+        cancellationToken.ThrowIfCancellationRequested();
+        return RenderThumbnail(bitmap, size);
+    }
+
+    private static Bitmap CopyImageWithinPixelLimit(Image source, int maxPixels)
+    {
+        Size targetSize = FitWithinPixelLimit(source.Size, maxPixels);
+        if (targetSize == source.Size)
+        {
+            return new Bitmap(source);
+        }
+
+        var bitmap = new Bitmap(targetSize.Width, targetSize.Height);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(Color.White);
+        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.SmoothingMode = SmoothingMode.HighQuality;
+        graphics.DrawImage(source, new Rectangle(Point.Empty, targetSize));
+        return bitmap;
+    }
+
+    private static Size FitWithinPixelLimit(Size sourceSize, int maxPixels)
+    {
+        if (sourceSize.Width <= 0 || sourceSize.Height <= 0)
+        {
+            return new Size(1, 1);
+        }
+
+        long pixelCount = (long)sourceSize.Width * sourceSize.Height;
+        if (pixelCount <= maxPixels)
+        {
+            return sourceSize;
+        }
+
+        double scale = Math.Sqrt(maxPixels / (double)pixelCount);
+        return new Size(
+            Math.Max(1, (int)Math.Floor(sourceSize.Width * scale)),
+            Math.Max(1, (int)Math.Floor(sourceSize.Height * scale)));
     }
 
     private static void ApplyExifOrientation(Image image)
@@ -1453,5 +1790,30 @@ public sealed class MainForm : Form
         int left = (target.Width - width) / 2;
         int top = (target.Height - height) / 2;
         return new Rectangle(left, top, width, height);
+    }
+
+    private readonly record struct ThumbnailCacheKey(
+        string Path,
+        long LastWriteTimeUtcTicks,
+        long Length,
+        int RotationDegrees,
+        int Width,
+        int Height);
+
+    private sealed class ThumbnailTileState(PictureBox pictureBox)
+    {
+        public PictureBox PictureBox { get; } = pictureBox;
+
+        public ScannerImageSelection? Image { get; set; }
+
+        public int Index { get; set; }
+
+        public bool IsSelected { get; set; }
+
+        public ThumbnailCacheKey? ThumbnailKey { get; set; }
+
+        public int ThumbnailRequestId { get; set; }
+
+        public bool HasLoadedThumbnail { get; set; }
     }
 }
