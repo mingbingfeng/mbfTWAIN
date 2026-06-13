@@ -40,8 +40,10 @@ public sealed class MainForm : Form
     private readonly GitHubUpdateService updateService = new();
     private readonly CancellationTokenSource updateCancellation = new();
     private CancellationTokenSource thumbnailLoadCancellation = new();
+    private SynchronizationContext? uiContext;
 
     private uint revision;
+    private bool pipeServerStarted;
     private bool scanRequested;
     private bool duplexEnabled;
     private string pixelType = "RGB";
@@ -66,12 +68,19 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = AppBackground;
 
-        pipeServer = new ScannerPipeServer(GetSnapshot, BeginScanSession, HideScanUi, AcknowledgeScan);
+        pipeServer = new ScannerPipeServer(
+            GetSnapshot,
+            sessionSettings => PostPipeCallback(() => BeginScanSession(sessionSettings)),
+            acknowledgedRevision => PostPipeCallback(() => HideScanUi(acknowledgedRevision)),
+            acknowledgedRevision => PostPipeCallback(() => AcknowledgeScan(acknowledgedRevision)));
         BuildLayout();
         UpdateSettingsSummary();
-        pipeServer.Start();
         RefreshQueueVisuals();
-        Shown += (_, _) => StartSilentUpdateCheck();
+        Shown += (_, _) =>
+        {
+            StartPipeServer();
+            StartSilentUpdateCheck();
+        };
         DiagnosticsLog.Write("UI", "MainForm initialized");
     }
 
@@ -318,6 +327,42 @@ public sealed class MainForm : Form
         }
 
         _ = Task.Run(() => CheckForUpdatesSilentlyAsync(updateCancellation.Token), updateCancellation.Token);
+    }
+
+    private void StartPipeServer()
+    {
+        if (pipeServerStarted)
+        {
+            return;
+        }
+
+        uiContext ??= SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        pipeServerStarted = true;
+        DiagnosticsLog.Write("UI", $"Starting pipe server after form shown handleCreated={IsHandleCreated}");
+        pipeServer.Start();
+    }
+
+    private void PostPipeCallback(Action callback)
+    {
+        SynchronizationContext? context = uiContext;
+        if (context is null)
+        {
+            DiagnosticsLog.Write("UI", "Ignoring pipe callback before UI context is ready");
+            return;
+        }
+
+        context.Post(
+            _ =>
+            {
+                if (IsDisposed || Disposing)
+                {
+                    DiagnosticsLog.Write("UI", "Ignoring pipe callback because form is disposing or disposed");
+                    return;
+                }
+
+                callback();
+            },
+            null);
     }
 
     private async Task CheckForUpdatesSilentlyAsync(CancellationToken cancellationToken)
@@ -860,47 +905,35 @@ public sealed class MainForm : Form
     {
         DiagnosticsLog.Write(
             "UI",
-            $"BeginScanSession requested disposed={IsDisposed} invokeRequired={InvokeRequired} handleCreated={IsHandleCreated} paper={sessionSettings?.PaperSize ?? "<none>"}");
+            $"BeginScanSession requested disposed={IsDisposed} handleCreated={IsHandleCreated} paper={sessionSettings?.PaperSize ?? "<none>"}");
         if (IsDisposed)
         {
             return;
         }
 
-        void Apply()
+        lock (stateLock)
         {
-            lock (stateLock)
+            if (sessionSettings is not null)
             {
-                if (sessionSettings is not null)
-                {
-                    ApplySessionSettings(sessionSettings);
-                }
-
-                selectedImages.Clear();
-                selectedImageIndex = -1;
-                scanRequested = false;
-                revision++;
+                ApplySessionSettings(sessionSettings);
             }
 
-            DiagnosticsLog.Write("UI", $"BeginScanSession.Apply revision={revision}");
-            RefreshQueueVisuals();
-            if (WindowState == FormWindowState.Minimized)
-            {
-                WindowState = FormWindowState.Normal;
-            }
-
-            Show();
-            Activate();
-            DiagnosticsLog.Write("UI", "BeginScanSession.Apply completed and window activated");
+            selectedImages.Clear();
+            selectedImageIndex = -1;
+            scanRequested = false;
+            revision++;
         }
 
-        if (InvokeRequired && IsHandleCreated)
+        DiagnosticsLog.Write("UI", $"BeginScanSession.Apply revision={revision}");
+        RefreshQueueVisuals();
+        if (WindowState == FormWindowState.Minimized)
         {
-            BeginInvoke((MethodInvoker)Apply);
+            WindowState = FormWindowState.Normal;
         }
-        else
-        {
-            Apply();
-        }
+
+        Show();
+        Activate();
+        DiagnosticsLog.Write("UI", "BeginScanSession.Apply completed and window activated");
     }
 
     private void ApplySessionSettings(ScannerSessionSettings settings)
@@ -947,12 +980,9 @@ public sealed class MainForm : Form
             return;
         }
 
-        BeginInvoke((MethodInvoker)(() =>
-        {
-            RefreshQueueVisuals();
-            Hide();
-            DiagnosticsLog.Write("UI", "AcknowledgeScan applied and window hidden");
-        }));
+        RefreshQueueVisuals();
+        Hide();
+        DiagnosticsLog.Write("UI", "AcknowledgeScan applied and window hidden");
     }
 
     private void HideScanUi(uint acknowledgedRevision)
@@ -970,11 +1000,8 @@ public sealed class MainForm : Form
             return;
         }
 
-        BeginInvoke((MethodInvoker)(() =>
-        {
-            Hide();
-            DiagnosticsLog.Write("UI", "HideScanUi applied and window hidden");
-        }));
+        Hide();
+        DiagnosticsLog.Write("UI", "HideScanUi applied and window hidden");
     }
 
     private void RefreshQueueVisuals()
