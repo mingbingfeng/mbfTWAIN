@@ -2,6 +2,13 @@
 
 `mbfTwain` is a phased virtual TWAIN 2.x scanner implementation.
 
+## License
+
+`mbfTwain` is public source-available software for noncommercial use
+under the [PolyForm Noncommercial License 1.0.0](LICENSE). Commercial
+use requires prior written permission from the copyright holder. See
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) and [NOTICE](NOTICE).
+
 Current work includes Phase 1 through Phase 4a scaffolding: the native C++
 TWAIN Data Source module exports `DS_Entry`, tracks source-loaded/opened/enabled
 and transfer-ready states, negotiates core scanner capabilities, connects to a
