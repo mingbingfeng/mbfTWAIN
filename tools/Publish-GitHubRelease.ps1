@@ -76,8 +76,15 @@ try {
     }
 
     Write-Step "Publishing GitHub release $Tag"
-    & gh release view $Tag --repo $Repo *> $null
-    $releaseExists = $LASTEXITCODE -eq 0
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & gh release view $Tag --repo $Repo *> $null
+        $releaseExists = $LASTEXITCODE -eq 0
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
 
     if ($releaseExists) {
         Invoke-Checked {
