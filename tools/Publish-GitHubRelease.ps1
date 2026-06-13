@@ -65,7 +65,7 @@ try {
         Write-Step "Pushing branch $Branch"
         Invoke-Checked { git push origin $Branch } "git push origin $Branch"
 
-        $existingTag = (& git tag --list $Tag).Trim()
+        $existingTag = (@(& git tag --list $Tag) -join "`n").Trim()
         if ([string]::IsNullOrWhiteSpace($existingTag)) {
             Write-Step "Creating tag $Tag"
             Invoke-Checked { git tag -a $Tag -m "Release $Tag" } "git tag $Tag"
