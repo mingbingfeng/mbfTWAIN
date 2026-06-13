@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -63,6 +64,41 @@ constexpr TW_UINT32 kMutableCapabilitySupport =
     TWQC_GET | TWQC_SET | TWQC_GETDEFAULT | TWQC_GETCURRENT | TWQC_RESET;
 constexpr TW_UINT32 kReadOnlyCapabilitySupport =
     TWQC_GET | TWQC_GETDEFAULT | TWQC_GETCURRENT;
+
+int g_moduleAnchor = 0;
+
+std::wstring ModulePath(HMODULE module)
+{
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;)
+    {
+        const DWORD length = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0)
+        {
+            return L"(unknown)";
+        }
+        if (length < buffer.size() - 1)
+        {
+            return std::wstring(buffer.data(), length);
+        }
+
+        buffer.resize(buffer.size() * 2U);
+    }
+}
+
+std::wstring CurrentModulePath()
+{
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&g_moduleAnchor),
+            &module))
+    {
+        return L"(unknown)";
+    }
+
+    return ModulePath(module);
+}
 
 void CopyTwainString(char* destination, size_t destinationSize, std::string_view source) noexcept
 {
@@ -783,7 +819,8 @@ VirtualTwainDataSource::VirtualTwainDataSource()
     settings_.yResolution = MakeFix32(300);
     diagnostics::AppendLine(
         L"DS",
-        L"VirtualTwainDataSource initialized logPath=" + diagnostics::LogFilePath());
+        L"VirtualTwainDataSource initialized module=" + CurrentModulePath() +
+            L" logPath=" + diagnostics::LogFilePath());
 }
 
 VirtualTwainDataSource::~VirtualTwainDataSource()
@@ -809,7 +846,7 @@ TW_UINT16 VirtualTwainDataSource::Entry(
     TW_UINT16 message,
     TW_MEMREF data)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     const std::wstring triplet = DescribeTriplet(dataGroup, dataArgumentType, message, data);
     diagnostics::AppendLine(
         L"DS",
@@ -819,7 +856,7 @@ TW_UINT16 VirtualTwainDataSource::Entry(
 
     if (dataGroup == DG_IMAGE)
     {
-        result = HandleImage(dataArgumentType, message, data);
+        result = HandleImage(dataArgumentType, message, data, lock);
     }
     else if (dataGroup != DG_CONTROL)
     {
@@ -830,19 +867,19 @@ TW_UINT16 VirtualTwainDataSource::Entry(
         switch (dataArgumentType)
         {
         case DAT_IDENTITY:
-            result = HandleIdentity(message, origin, data);
+            result = HandleIdentity(message, origin, data, lock);
             break;
         case DAT_CAPABILITY:
             result = HandleCapability(message, data);
             break;
         case DAT_USERINTERFACE:
-            result = HandleUserInterface(message, data);
+            result = HandleUserInterface(message, data, lock);
             break;
         case DAT_EVENT:
-            result = HandleEvent(message, data);
+            result = HandleEvent(message, data, lock);
             break;
         case DAT_PENDINGXFERS:
-            result = HandlePendingTransfers(message, data);
+            result = HandlePendingTransfers(message, data, lock);
             break;
         case DAT_SETUPMEMXFER:
             result = HandleSetupMemoryTransfer(message, data);
@@ -862,6 +899,11 @@ TW_UINT16 VirtualTwainDataSource::Entry(
         }
     }
 
+    if (!lock.owns_lock())
+    {
+        lock.lock();
+    }
+
     diagnostics::AppendLine(
         L"DS",
         L"Entry end state=" + TwainStateName(state_) +
@@ -874,7 +916,8 @@ TW_UINT16 VirtualTwainDataSource::Entry(
 TW_UINT16 VirtualTwainDataSource::HandleIdentity(
     TW_UINT16 message,
     pTW_IDENTITY origin,
-    TW_MEMREF data)
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     auto* requestedIdentity = static_cast<pTW_IDENTITY>(data);
 
@@ -921,11 +964,11 @@ TW_UINT16 VirtualTwainDataSource::HandleIdentity(
 
         if (pendingIpcRevision_ != 0)
         {
-            AcknowledgeScanIfComplete();
+            AcknowledgeScanIfComplete(lock);
         }
         else
         {
-            HideScanUiSession();
+            HideScanUiSession(lock);
         }
 
         state_ = TwainState::SourceLoaded;
@@ -976,7 +1019,10 @@ TW_UINT16 VirtualTwainDataSource::HandleCapability(TW_UINT16 message, TW_MEMREF 
     }
 }
 
-TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMREF data)
+TW_UINT16 VirtualTwainDataSource::HandleUserInterface(
+    TW_UINT16 message,
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     auto* userInterface = static_cast<pTW_USERINTERFACE>(data);
     if (userInterface == nullptr)
@@ -994,17 +1040,28 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
             return Fail(TWCC_SEQERROR);
         }
 
+        const bool forceUi = EnvironmentFlagEnabled(L"MBF_TWAIN_FORCE_UI");
         const bool shouldShowUi =
             message == MSG_ENABLEDSUIONLY ||
             userInterface->ShowUI != FALSE ||
-            EnvironmentFlagEnabled(L"MBF_TWAIN_FORCE_UI");
+            forceUi;
+
+        ScannerIpcState initialState{};
+        if (shouldShowUi)
+        {
+            initialState.duplexEnabled = settings_.duplexEnabled != FALSE;
+            initialState.pixelType = PixelTypeToProtocol(settings_.pixelType);
+            initialState.paperSize = PaperSizeToProtocol(settings_.paperSize);
+            initialState.xResolution = Fix32WholeOrDefault(settings_.xResolution, 300);
+            initialState.yResolution = Fix32WholeOrDefault(settings_.yResolution, 300);
+        }
 
         diagnostics::AppendLine(
             L"DS",
             L"HandleUserInterface enable shouldShowUi=" + std::to_wstring(shouldShowUi ? 1U : 0U) +
                 L" showUI=" + std::to_wstring(userInterface->ShowUI != FALSE ? 1U : 0U) +
                 L" forceUi=" +
-                std::to_wstring(EnvironmentFlagEnabled(L"MBF_TWAIN_FORCE_UI") ? 1U : 0U));
+                std::to_wstring(forceUi ? 1U : 0U));
 
         transferReady_ = false;
         transferReadyNotified_ = false;
@@ -1015,20 +1072,47 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
         ClearTransferProgress();
         state_ = TwainState::SourceEnabled;
 
-        if (shouldShowUi && !BeginUiScanSession(true))
+        if (shouldShowUi)
         {
-            state_ = TwainState::SourceOpened;
-            diagnostics::AppendLine(
-                L"DS",
-                L"BeginUiScanSession failed during enable; reverting to SourceOpened");
-            return Fail(TWCC_OPERATIONERROR);
+            lock.unlock();
+            const bool scanSessionStarted = BeginUiScanSession(initialState);
+            lock.lock();
+
+            if (state_ != TwainState::SourceEnabled)
+            {
+                diagnostics::AppendLine(
+                    L"DS",
+                    L"BeginUiScanSession completed after state changed to " + TwainStateName(state_));
+                return Fail(TWCC_SEQERROR);
+            }
+
+            if (!scanSessionStarted)
+            {
+                state_ = TwainState::SourceOpened;
+                diagnostics::AppendLine(
+                    L"DS",
+                    L"BeginUiScanSession failed during enable; reverting to SourceOpened");
+                return Fail(TWCC_OPERATIONERROR);
+            }
         }
 
-        if (!shouldShowUi && RefreshTransferReadyFromIpc())
+        if (!shouldShowUi)
         {
-            transferReady_ = true;
-            state_ = TwainState::TransferReady;
-            NotifyTransferReady();
+            const bool transferReady = RefreshTransferReadyFromIpc(lock);
+            if (state_ != TwainState::SourceEnabled)
+            {
+                diagnostics::AppendLine(
+                    L"DS",
+                    L"RefreshTransferReadyFromIpc completed after state changed to " + TwainStateName(state_));
+                return Fail(TWCC_SEQERROR);
+            }
+
+            if (transferReady)
+            {
+                transferReady_ = true;
+                state_ = TwainState::TransferReady;
+                NotifyTransferReady(lock);
+            }
         }
         else if (shouldShowUi && message == MSG_ENABLEDS)
         {
@@ -1054,11 +1138,11 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
         StopTransferReadyWatcher();
         if (pendingIpcRevision_ != 0)
         {
-            AcknowledgeScanIfComplete();
+            AcknowledgeScanIfComplete(lock);
         }
         else
         {
-            HideScanUiSession();
+            HideScanUiSession(lock);
         }
         ClearTransferProgress();
         state_ = TwainState::SourceOpened;
@@ -1069,7 +1153,10 @@ TW_UINT16 VirtualTwainDataSource::HandleUserInterface(TW_UINT16 message, TW_MEMR
     }
 }
 
-TW_UINT16 VirtualTwainDataSource::HandleEvent(TW_UINT16 message, TW_MEMREF data)
+TW_UINT16 VirtualTwainDataSource::HandleEvent(
+    TW_UINT16 message,
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     if (message != MSG_PROCESSEVENT)
     {
@@ -1090,7 +1177,14 @@ TW_UINT16 VirtualTwainDataSource::HandleEvent(TW_UINT16 message, TW_MEMREF data)
 
     if (!transferReady_ && !closeDsRequest_)
     {
-        transferReady_ = RefreshTransferReadyFromIpc();
+        transferReady_ = RefreshTransferReadyFromIpc(lock);
+        if (!IsAtLeast(TwainState::SourceEnabled))
+        {
+            diagnostics::AppendLine(
+                L"DS",
+                L"HandleEvent refresh completed after state changed to " + TwainStateName(state_));
+            return Fail(TWCC_SEQERROR);
+        }
     }
 
     if (closeDsRequest_)
@@ -1116,7 +1210,10 @@ TW_UINT16 VirtualTwainDataSource::HandleEvent(TW_UINT16 message, TW_MEMREF data)
     return TWRC_NOTDSEVENT;
 }
 
-TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_MEMREF data)
+TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(
+    TW_UINT16 message,
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     auto* pendingTransfers = static_cast<pTW_PENDINGXFERS>(data);
     if (pendingTransfers == nullptr)
@@ -1170,7 +1267,7 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
             hasCurrentTransferImage_ = false;
             ResetMemoryTransfer();
             state_ = TwainState::SourceEnabled;
-            AcknowledgeScanIfComplete();
+            AcknowledgeScanIfComplete(lock);
         }
 
         return Succeed();
@@ -1193,7 +1290,7 @@ TW_UINT16 VirtualTwainDataSource::HandlePendingTransfers(TW_UINT16 message, TW_M
         currentTransferImageIndex_ = 0;
         ResetMemoryTransfer();
         state_ = resetState;
-        AcknowledgeScanIfComplete();
+        AcknowledgeScanIfComplete(lock);
         return Succeed();
     }
 
@@ -1253,22 +1350,26 @@ TW_UINT16 VirtualTwainDataSource::HandleSetupMemoryTransfer(TW_UINT16 message, T
 TW_UINT16 VirtualTwainDataSource::HandleImage(
     TW_UINT16 dataArgumentType,
     TW_UINT16 message,
-    TW_MEMREF data)
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     switch (dataArgumentType)
     {
     case DAT_IMAGEINFO:
-        return HandleImageInfo(message, data);
+        return HandleImageInfo(message, data, lock);
     case DAT_IMAGENATIVEXFER:
-        return HandleImageNativeTransfer(message, data);
+        return HandleImageNativeTransfer(message, data, lock);
     case DAT_IMAGEMEMXFER:
-        return HandleImageMemoryTransfer(message, data);
+        return HandleImageMemoryTransfer(message, data, lock);
     default:
         return Fail(TWCC_BADPROTOCOL);
     }
 }
 
-TW_UINT16 VirtualTwainDataSource::HandleImageInfo(TW_UINT16 message, TW_MEMREF data)
+TW_UINT16 VirtualTwainDataSource::HandleImageInfo(
+    TW_UINT16 message,
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     if (message != MSG_GET)
     {
@@ -1287,7 +1388,7 @@ TW_UINT16 VirtualTwainDataSource::HandleImageInfo(TW_UINT16 message, TW_MEMREF d
 
     TW_UINT32 imageIndex = 0;
     if (!TryResolveImageInfoIndex(imageIndex) ||
-        !FillImageInfo(imageIndex, imageInfo))
+        !FillImageInfo(imageIndex, imageInfo, lock))
     {
         return Fail(TWCC_OPERATIONERROR);
     }
@@ -1295,7 +1396,10 @@ TW_UINT16 VirtualTwainDataSource::HandleImageInfo(TW_UINT16 message, TW_MEMREF d
     return Succeed();
 }
 
-TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(TW_UINT16 message, TW_MEMREF data)
+TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(
+    TW_UINT16 message,
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     if (message != MSG_GET)
     {
@@ -1318,17 +1422,37 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(TW_UINT16 message, T
 
     DecodedImageInfo decodedInfo{};
     const TW_UINT32 imageIndex = pendingTransferIndex_;
-    const ScannerIpcImage& selectedImage = pendingImages_[imageIndex];
+    const ScannerIpcImage selectedImage = pendingImages_[imageIndex];
+    const TW_UINT16 pixelType = settings_.pixelType;
+    const std::uint32_t xResolution = Fix32WholeOrDefault(settings_.xResolution, 300);
+    const std::uint32_t yResolution = Fix32WholeOrDefault(settings_.yResolution, 300);
+
+    lock.unlock();
     TW_HANDLE dib = ImageDib::BuildNativeDib(
         selectedImage.path,
-        settings_.pixelType,
-        Fix32WholeOrDefault(settings_.xResolution, 300),
-        Fix32WholeOrDefault(settings_.yResolution, 300),
+        pixelType,
+        xResolution,
+        yResolution,
         selectedImage.rotationDegrees,
         decodedInfo);
+    lock.lock();
+
     if (dib == nullptr)
     {
         return Fail(TWCC_OPERATIONERROR);
+    }
+
+    if (state_ != TwainState::TransferReady ||
+        pendingTransferIndex_ != imageIndex ||
+        imageIndex >= pendingImages_.size() ||
+        pendingImages_[imageIndex].path != selectedImage.path ||
+        pendingImages_[imageIndex].rotationDegrees != selectedImage.rotationDegrees ||
+        settings_.pixelType != pixelType ||
+        Fix32WholeOrDefault(settings_.xResolution, 300) != xResolution ||
+        Fix32WholeOrDefault(settings_.yResolution, 300) != yResolution)
+    {
+        GlobalFree(dib);
+        return Fail(TWCC_SEQERROR);
     }
 
     *outputHandle = dib;
@@ -1337,13 +1461,16 @@ TW_UINT16 VirtualTwainDataSource::HandleImageNativeTransfer(TW_UINT16 message, T
     hasCurrentTransferImage_ = true;
     state_ = TwainState::Transferring;
     transferReady_ = pendingTransferIndex_ < pendingImages_.size();
-    HideScanUiIfTransferStarted();
+    HideScanUiIfTransferStarted(lock);
     lastStatus_.ConditionCode = TWCC_SUCCESS;
     lastStatus_.Data = 0;
     return TWRC_XFERDONE;
 }
 
-TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(TW_UINT16 message, TW_MEMREF data)
+TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(
+    TW_UINT16 message,
+    TW_MEMREF data,
+    std::unique_lock<std::mutex>& lock)
 {
     if (message != MSG_GET)
     {
@@ -1360,7 +1487,7 @@ TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(TW_UINT16 message, T
         return Fail(TWCC_BADVALUE);
     }
 
-    if (!EnsureMemoryTransferReady())
+    if (!EnsureMemoryTransferReady(lock))
     {
         return Fail(TWCC_OPERATIONERROR);
     }
@@ -1414,7 +1541,7 @@ TW_UINT16 VirtualTwainDataSource::HandleImageMemoryTransfer(TW_UINT16 message, T
         ++pendingTransferIndex_;
         transferReady_ = pendingTransferIndex_ < pendingImages_.size();
         ResetMemoryTransfer();
-        HideScanUiIfTransferStarted();
+        HideScanUiIfTransferStarted(lock);
         return TWRC_XFERDONE;
     }
 
@@ -1866,13 +1993,16 @@ TW_UINT16 VirtualTwainDataSource::ResetCapabilityValue(TW_UINT16 capability) noe
     }
 }
 
-bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
+bool VirtualTwainDataSource::RefreshTransferReadyFromIpc(std::unique_lock<std::mutex>& lock)
 {
     ScannerIpcClient client;
     ScannerIpcState ipcState{};
-    if (!client.TryGetState(ipcState, 30))
+    lock.unlock();
+    const bool gotState = client.TryGetState(ipcState, 30);
+    if (!gotState)
     {
         diagnostics::AppendLine(L"DS", L"RefreshTransferReadyFromIpc GET_STATE failed");
+        lock.lock();
         return false;
     }
 
@@ -1885,6 +2015,15 @@ bool VirtualTwainDataSource::RefreshTransferReadyFromIpc()
             L" paper=" + ipcState.paperSize +
             L" xres=" + std::to_wstring(ipcState.xResolution) +
             L" yres=" + std::to_wstring(ipcState.yResolution));
+
+    lock.lock();
+    if (!IsAtLeast(TwainState::SourceEnabled))
+    {
+        diagnostics::AppendLine(
+            L"DS",
+            L"RefreshTransferReadyFromIpc discarded because state=" + TwainStateName(state_));
+        return false;
+    }
 
     ApplyScannerSettingsFromIpc(ipcState);
 
@@ -1961,7 +2100,7 @@ void VirtualTwainDataSource::CommitTransferReadyFromIpc(ScannerIpcState&& ipcSta
             L" xferCount=" + std::to_wstring(settings_.transferCount));
 }
 
-bool VirtualTwainDataSource::NotifyTransferReady()
+bool VirtualTwainDataSource::NotifyTransferReady(std::unique_lock<std::mutex>& lock)
 {
     if (transferReadyNotified_)
     {
@@ -1983,7 +2122,11 @@ bool VirtualTwainDataSource::NotifyTransferReady()
 
     TW_IDENTITY sourceIdentity = identity_;
     TW_IDENTITY appIdentity = *openOrigin_;
-    const TW_UINT16 rc = entryPoint_.DSM_Entry(
+    const TW_ENTRYPOINT entryPoint = entryPoint_;
+    const std::uint32_t revision = pendingIpcRevision_;
+
+    lock.unlock();
+    const TW_UINT16 rc = entryPoint.DSM_Entry(
         &sourceIdentity,
         &appIdentity,
         DG_CONTROL,
@@ -1996,9 +2139,13 @@ bool VirtualTwainDataSource::NotifyTransferReady()
         L"NotifyTransferReady DAT_NULL/MSG_XFERREADY rc=" + std::to_wstring(rc) +
             L" sourceId=" + std::to_wstring(sourceIdentity.Id) +
             L" appId=" + std::to_wstring(appIdentity.Id));
+    lock.lock();
     if (rc == TWRC_SUCCESS)
     {
-        transferReadyNotified_ = true;
+        if (pendingIpcRevision_ == revision)
+        {
+            transferReadyNotified_ = true;
+        }
         return true;
     }
 
@@ -2260,21 +2407,9 @@ void VirtualTwainDataSource::TransferReadyWatcherLoop()
     diagnostics::AppendLine(L"DS", L"Transfer ready watcher thread exiting");
 }
 
-bool VirtualTwainDataSource::BeginUiScanSession(bool shouldShowUi)
+bool VirtualTwainDataSource::BeginUiScanSession(const ScannerIpcState& initialState)
 {
-    if (!shouldShowUi)
-    {
-        diagnostics::AppendLine(L"DS", L"BeginUiScanSession skipped because shouldShowUi=false");
-        return false;
-    }
-
     ScannerIpcClient client;
-    ScannerIpcState initialState{};
-    initialState.duplexEnabled = settings_.duplexEnabled != FALSE;
-    initialState.pixelType = PixelTypeToProtocol(settings_.pixelType);
-    initialState.paperSize = PaperSizeToProtocol(settings_.paperSize);
-    initialState.xResolution = Fix32WholeOrDefault(settings_.xResolution, 300);
-    initialState.yResolution = Fix32WholeOrDefault(settings_.yResolution, 300);
 
     if (client.BeginScan(initialState, 250))
     {
@@ -2374,30 +2509,52 @@ bool VirtualTwainDataSource::TryResolveImageInfoIndex(TW_UINT32& imageIndex) con
     return false;
 }
 
-bool VirtualTwainDataSource::FillImageInfo(TW_UINT32 imageIndex, pTW_IMAGEINFO imageInfo)
+bool VirtualTwainDataSource::FillImageInfo(
+    TW_UINT32 imageIndex,
+    pTW_IMAGEINFO imageInfo,
+    std::unique_lock<std::mutex>& lock)
 {
     if (imageInfo == nullptr || imageIndex >= pendingImages_.size())
     {
         return false;
     }
 
-    const ScannerIpcImage& selectedImage = pendingImages_[imageIndex];
+    const ScannerIpcImage selectedImage = pendingImages_[imageIndex];
+    const TW_FIX32 xResolution = settings_.xResolution;
+    const TW_FIX32 yResolution = settings_.yResolution;
+    const TW_UINT16 pixelType = settings_.pixelType;
+
     DecodedImageInfo decodedInfo{};
+    lock.unlock();
     if (!ImageDib::Probe(selectedImage.path, decodedInfo, selectedImage.rotationDegrees))
+    {
+        lock.lock();
+        return false;
+    }
+    lock.lock();
+
+    if (imageIndex >= pendingImages_.size() ||
+        pendingImages_[imageIndex].path != selectedImage.path ||
+        pendingImages_[imageIndex].rotationDegrees != selectedImage.rotationDegrees ||
+        settings_.xResolution.Whole != xResolution.Whole ||
+        settings_.xResolution.Frac != xResolution.Frac ||
+        settings_.yResolution.Whole != yResolution.Whole ||
+        settings_.yResolution.Frac != yResolution.Frac ||
+        settings_.pixelType != pixelType)
     {
         return false;
     }
 
     std::memset(imageInfo, 0, sizeof(*imageInfo));
-    imageInfo->XResolution = settings_.xResolution;
-    imageInfo->YResolution = settings_.yResolution;
+    imageInfo->XResolution = xResolution;
+    imageInfo->YResolution = yResolution;
     imageInfo->ImageWidth = static_cast<TW_INT32>(decodedInfo.width);
     imageInfo->ImageLength = static_cast<TW_INT32>(decodedInfo.height);
     imageInfo->Planar = FALSE;
-    imageInfo->PixelType = static_cast<TW_INT16>(settings_.pixelType);
+    imageInfo->PixelType = static_cast<TW_INT16>(pixelType);
     imageInfo->Compression = TWCP_NONE;
 
-    switch (settings_.pixelType)
+    switch (pixelType)
     {
     case TWPT_BW:
         imageInfo->SamplesPerPixel = 1;
@@ -2422,7 +2579,7 @@ bool VirtualTwainDataSource::FillImageInfo(TW_UINT32 imageIndex, pTW_IMAGEINFO i
     return true;
 }
 
-bool VirtualTwainDataSource::EnsureMemoryTransferReady()
+bool VirtualTwainDataSource::EnsureMemoryTransferReady(std::unique_lock<std::mutex>& lock)
 {
     if (pendingTransferIndex_ >= pendingImages_.size())
     {
@@ -2436,18 +2593,34 @@ bool VirtualTwainDataSource::EnsureMemoryTransferReady()
 
     ResetMemoryTransfer();
     RasterImage raster{};
-    const ScannerIpcImage& selectedImage = pendingImages_[pendingTransferIndex_];
+    const TW_UINT32 imageIndex = pendingTransferIndex_;
+    const ScannerIpcImage selectedImage = pendingImages_[imageIndex];
+    const TW_UINT16 pixelType = settings_.pixelType;
+
+    lock.unlock();
     if (!ImageDib::BuildRaster(
             selectedImage.path,
-            settings_.pixelType,
+            pixelType,
             raster,
             selectedImage.rotationDegrees))
+    {
+        lock.lock();
+        return false;
+    }
+    lock.lock();
+
+    if ((state_ != TwainState::TransferReady && state_ != TwainState::Transferring) ||
+        pendingTransferIndex_ != imageIndex ||
+        imageIndex >= pendingImages_.size() ||
+        pendingImages_[imageIndex].path != selectedImage.path ||
+        pendingImages_[imageIndex].rotationDegrees != selectedImage.rotationDegrees ||
+        settings_.pixelType != pixelType)
     {
         return false;
     }
 
     memoryTransfer_.active = true;
-    memoryTransfer_.imageIndex = pendingTransferIndex_;
+    memoryTransfer_.imageIndex = imageIndex;
     memoryTransfer_.nextRow = 0;
     memoryTransfer_.image = std::move(raster);
     return !memoryTransfer_.image.pixels.empty();
@@ -2461,29 +2634,31 @@ void VirtualTwainDataSource::ResetMemoryTransfer() noexcept
     memoryTransfer_.image = RasterImage{};
 }
 
-void VirtualTwainDataSource::HideScanUiSession()
+void VirtualTwainDataSource::HideScanUiSession(std::unique_lock<std::mutex>& lock)
 {
     const std::uint32_t revision = pendingIpcRevision_;
     ScannerIpcClient client;
+    lock.unlock();
     const bool hidden = client.HideScanUi(revision, 30);
     diagnostics::AppendLine(
         L"DS",
         L"HideScanUi revision=" + std::to_wstring(revision) +
             L" success=" + std::to_wstring(hidden ? 1U : 0U));
-    if (hidden && revision != 0)
+    lock.lock();
+    if (hidden && revision != 0 && pendingIpcRevision_ == revision)
     {
         scanUiHiddenForCurrentTransfer_ = true;
     }
 }
 
-void VirtualTwainDataSource::HideScanUiIfTransferStarted()
+void VirtualTwainDataSource::HideScanUiIfTransferStarted(std::unique_lock<std::mutex>& lock)
 {
     if (pendingIpcRevision_ == 0 || scanUiHiddenForCurrentTransfer_)
     {
         return;
     }
 
-    HideScanUiSession();
+    HideScanUiSession(lock);
 }
 
 void VirtualTwainDataSource::ClearTransferProgress() noexcept
@@ -2500,20 +2675,23 @@ void VirtualTwainDataSource::ClearTransferProgress() noexcept
     ResetMemoryTransfer();
 }
 
-void VirtualTwainDataSource::AcknowledgeScanIfComplete()
+void VirtualTwainDataSource::AcknowledgeScanIfComplete(std::unique_lock<std::mutex>& lock)
 {
     if (pendingIpcRevision_ == 0)
     {
         return;
     }
 
+    const std::uint32_t revision = pendingIpcRevision_;
+    pendingIpcRevision_ = 0;
     ScannerIpcClient client;
-    const bool acknowledged = client.AcknowledgeScan(pendingIpcRevision_, 30);
+    lock.unlock();
+    const bool acknowledged = client.AcknowledgeScan(revision, 30);
     diagnostics::AppendLine(
         L"DS",
-        L"AcknowledgeScan revision=" + std::to_wstring(pendingIpcRevision_) +
+        L"AcknowledgeScan revision=" + std::to_wstring(revision) +
             L" success=" + std::to_wstring(acknowledged ? 1U : 0U));
-    pendingIpcRevision_ = 0;
+    lock.lock();
 }
 
 void VirtualTwainDataSource::RollbackCanceledUiEnable()
