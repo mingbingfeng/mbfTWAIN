@@ -40,7 +40,7 @@ public sealed partial class MainForm
         {
             Dock = DockStyle.Top,
             ColumnCount = 3,
-            RowCount = 2,
+            RowCount = 3,
             AutoSize = true,
             BackColor = SurfaceBackground,
             Margin = new Padding(0),
@@ -48,6 +48,7 @@ public sealed partial class MainForm
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
@@ -93,6 +94,10 @@ public sealed partial class MainForm
         header.Controls.Add(subtitle, 0, 1);
         header.SetColumnSpan(subtitle, 2);
 
+        ConfigureRememberImagesCheckBox();
+        header.Controls.Add(rememberImagesCheckBox, 0, 2);
+        header.SetColumnSpan(rememberImagesCheckBox, 2);
+
         return header;
     }
 
@@ -106,6 +111,22 @@ public sealed partial class MainForm
         clearImagesLink.Margin = new Padding(0, 2, 0, 0);
         clearImagesLink.LinkBehavior = LinkBehavior.AlwaysUnderline;
         clearImagesLink.LinkClicked += (_, _) => ClearImages();
+    }
+
+    private void ConfigureRememberImagesCheckBox()
+    {
+        rememberImagesCheckBox.AutoSize = true;
+        rememberImagesCheckBox.Text = "记住最后选择的图片";
+        rememberImagesCheckBox.Checked = rememberSelectedImages;
+        rememberImagesCheckBox.ForeColor = Color.FromArgb(49, 58, 52);
+        rememberImagesCheckBox.Margin = new Padding(0, 10, 0, 0);
+        rememberImagesCheckBox.CheckedChanged -= RememberImagesCheckBoxChanged;
+        rememberImagesCheckBox.CheckedChanged += RememberImagesCheckBoxChanged;
+    }
+
+    private void RememberImagesCheckBoxChanged(object? sender, System.EventArgs e)
+    {
+        SetRememberSelectedImages(rememberImagesCheckBox.Checked);
     }
 
     private void RefreshQueueVisuals()

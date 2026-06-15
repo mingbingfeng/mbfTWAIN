@@ -114,7 +114,7 @@ directory, or set `MBF_TWAIN_UI_EXE` to the full path of
 Build and package a release installer with the local Inno Setup 6 installation:
 
 ```powershell
-.\tools\Build-Release.ps1 -Version 1.0.2 -InnoSetupPath "D:\Program Files (x86)\Inno Setup 6"
+.\tools\Build-Release.ps1 -Version 1.0.3 -InnoSetupPath "D:\Program Files (x86)\Inno Setup 6"
 ```
 
 The script reuses `Install-LocalTwain.ps1` in build-only mode, stages both
@@ -129,7 +129,7 @@ build\release\mbfTwain-Setup-v<version>.exe.sha256
 Publish the committed build to GitHub Releases after packaging:
 
 ```powershell
-.\tools\Publish-GitHubRelease.ps1 -Version 1.0.2
+.\tools\Publish-GitHubRelease.ps1 -Version 1.0.3
 ```
 
 The installer copies the DS and UI runtime files into `C:\Windows\twain_32`

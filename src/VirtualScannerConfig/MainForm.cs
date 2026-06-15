@@ -37,6 +37,7 @@ public sealed partial class MainForm : Form
     private readonly List<ScannerImageSelection> selectedImages = [];
     private readonly ThumbnailCache thumbnailCache = new(ThumbnailCacheLimit);
     private readonly ScannerPipeServer pipeServer;
+    private readonly UiUserSettingsStore userSettingsStore = new();
     private readonly GitHubUpdateService updateService = new();
     private readonly CancellationTokenSource updateCancellation = new();
     private CancellationTokenSource thumbnailLoadCancellation = new();
@@ -46,17 +47,20 @@ public sealed partial class MainForm : Form
     private bool pipeServerStarted;
     private bool scanRequested;
     private bool duplexEnabled;
+    private bool rememberSelectedImages;
     private string pixelType = "RGB";
     private string paperSize = "A4";
     private int scanDpi = 300;
     private int transferBufferDelayMilliseconds = DefaultTransferBufferDelayMilliseconds;
     private int selectedImageIndex = -1;
     private int hoveredImageIndex = -1;
+    private ScannerImageSelection[] rememberedImages = [];
     private ReleaseUpdateInfo? latestRelease;
     private TransferProgressDialog? transferProgressDialog;
 
     private readonly FlowLayoutPanel thumbnailStrip = new();
     private readonly LinkLabel clearImagesLink = new();
+    private readonly CheckBox rememberImagesCheckBox = new();
     private readonly Label settingsSummaryLabel = new();
     private readonly Button settingsButton = new();
     private readonly Label statusLabel = new();
@@ -70,6 +74,12 @@ public sealed partial class MainForm : Form
         MinimumSize = new Size(820, 560);
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = AppBackground;
+
+        LoadUserSettings();
+        lock (stateLock)
+        {
+            ApplyRememberedImagesToSelection();
+        }
 
         pipeServer = new ScannerPipeServer(
             GetSnapshot,
@@ -221,6 +231,126 @@ public sealed partial class MainForm : Form
     {
         settingsSummaryLabel.Text =
             $"{pixelType} · {paperSize} · {scanDpi} DPI · {(duplexEnabled ? "双面" : "单面")} · 间隔 {transferBufferDelayMilliseconds}ms";
+    }
+
+    private void LoadUserSettings()
+    {
+        try
+        {
+            UiUserSettings settings = userSettingsStore.Load();
+            rememberSelectedImages = settings.RememberSelectedImages;
+            rememberedImages = NormalizeRememberedImages(settings.RememberedImages);
+            DiagnosticsLog.Write(
+                "UI",
+                $"Loaded user settings rememberSelectedImages={rememberSelectedImages} rememberedImageCount={rememberedImages.Length} path={userSettingsStore.PathOnDisk}");
+        }
+        catch (Exception exception)
+        {
+            rememberSelectedImages = false;
+            rememberedImages = [];
+            DiagnosticsLog.WriteException("UI", exception, "Load user settings");
+        }
+    }
+
+    private void ApplyRememberedImagesToSelection()
+    {
+        selectedImages.Clear();
+        if (rememberSelectedImages && rememberedImages.Length > 0)
+        {
+            selectedImages.AddRange(rememberedImages);
+        }
+
+        selectedImageIndex = selectedImages.Count > 0 ? 0 : -1;
+        hoveredImageIndex = -1;
+    }
+
+    private static ScannerImageSelection[] NormalizeRememberedImages(IEnumerable<ScannerImageSelection>? images)
+    {
+        if (images is null)
+        {
+            return [];
+        }
+
+        var normalized = new List<ScannerImageSelection>();
+        foreach (ScannerImageSelection image in images)
+        {
+            if (string.IsNullOrWhiteSpace(image.Path))
+            {
+                continue;
+            }
+
+            try
+            {
+                string fullPath = Path.GetFullPath(image.Path);
+                if (!File.Exists(fullPath))
+                {
+                    continue;
+                }
+
+                normalized.Add(new ScannerImageSelection(fullPath, NormalizeRotationDegrees(image.RotationDegrees)));
+            }
+            catch
+            {
+                // Ignore invalid persisted paths and keep loading the rest of the queue.
+            }
+        }
+
+        return [.. normalized];
+    }
+
+    private void SetRememberSelectedImages(bool enabled)
+    {
+        ScannerImageSelection[] snapshot = [];
+        lock (stateLock)
+        {
+            rememberSelectedImages = enabled;
+            rememberedImages = enabled
+                ? CaptureSelectedImagesSnapshotUnsafe()
+                : [];
+            snapshot = rememberedImages;
+        }
+
+        SaveUserSettings(enabled, snapshot);
+        DiagnosticsLog.Write("UI", $"Remember selected images toggled enabled={enabled} count={snapshot.Length}");
+    }
+
+    private void SaveRememberedImagesFromCurrentSelection()
+    {
+        ScannerImageSelection[] snapshot;
+        lock (stateLock)
+        {
+            if (!rememberSelectedImages)
+            {
+                return;
+            }
+
+            rememberedImages = CaptureSelectedImagesSnapshotUnsafe();
+            snapshot = rememberedImages;
+        }
+
+        SaveUserSettings(true, snapshot);
+    }
+
+    private ScannerImageSelection[] CaptureSelectedImagesSnapshotUnsafe()
+    {
+        return [.. selectedImages.Select(image =>
+            new ScannerImageSelection(Path.GetFullPath(image.Path), NormalizeRotationDegrees(image.RotationDegrees)))];
+    }
+
+    private void SaveUserSettings(bool rememberImages, IReadOnlyList<ScannerImageSelection> images)
+    {
+        try
+        {
+            userSettingsStore.Save(new UiUserSettings
+            {
+                RememberSelectedImages = rememberImages,
+                RememberedImages = [.. images],
+            });
+        }
+        catch (Exception exception)
+        {
+            DiagnosticsLog.WriteException("UI", exception, "Save user settings");
+        }
     }
 
     private void StartSilentUpdateCheck()
@@ -682,6 +812,7 @@ public sealed partial class MainForm : Form
         }
 
         RefreshQueueVisuals();
+        SaveRememberedImagesFromCurrentSelection();
         return true;
     }
 
@@ -731,6 +862,7 @@ public sealed partial class MainForm : Form
             }
 
             RefreshQueueVisuals();
+            SaveRememberedImagesFromCurrentSelection();
         }
     }
 
@@ -746,6 +878,7 @@ public sealed partial class MainForm : Form
 
         CloseTransferProgressDialog();
         RefreshQueueVisuals();
+        SaveRememberedImagesFromCurrentSelection();
     }
 
     private void MoveImage(int index, int direction)
@@ -772,6 +905,7 @@ public sealed partial class MainForm : Form
         if (moved)
         {
             RefreshQueueVisuals();
+            SaveRememberedImagesFromCurrentSelection();
         }
     }
 
@@ -796,6 +930,7 @@ public sealed partial class MainForm : Form
         if (rotated)
         {
             RefreshQueueVisuals();
+            SaveRememberedImagesFromCurrentSelection();
         }
     }
 
@@ -869,8 +1004,7 @@ public sealed partial class MainForm : Form
                 ApplySessionSettings(sessionSettings);
             }
 
-            selectedImages.Clear();
-            selectedImageIndex = -1;
+            ApplyRememberedImagesToSelection();
             scanRequested = false;
             revision++;
         }
