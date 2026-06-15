@@ -51,6 +51,7 @@ public sealed partial class MainForm : Form
     private int scanDpi = 300;
     private int transferBufferDelayMilliseconds = DefaultTransferBufferDelayMilliseconds;
     private int selectedImageIndex = -1;
+    private int hoveredImageIndex = -1;
     private ReleaseUpdateInfo? latestRelease;
     private TransferProgressDialog? transferProgressDialog;
 
@@ -1091,10 +1092,16 @@ public sealed partial class MainForm : Form
             if (selectedImages.Count == 0)
             {
                 selectedImageIndex = -1;
+                hoveredImageIndex = -1;
             }
             else if (selectedImageIndex < 0 || selectedImageIndex >= selectedImages.Count)
             {
                 selectedImageIndex = 0;
+            }
+
+            if (hoveredImageIndex < 0 || hoveredImageIndex >= selectedImages.Count)
+            {
+                hoveredImageIndex = -1;
             }
         }
     }
@@ -1103,10 +1110,12 @@ public sealed partial class MainForm : Form
     {
         List<ScannerImageSelection> snapshot;
         int activeIndex;
+        int hoveredIndex;
         lock (stateLock)
         {
             snapshot = [.. selectedImages];
             activeIndex = selectedImageIndex;
+            hoveredIndex = hoveredImageIndex;
         }
 
         CancellationToken cancellationToken = RestartThumbnailLoads();
@@ -1120,11 +1129,23 @@ public sealed partial class MainForm : Form
                 Control? existing = index < thumbnailStrip.Controls.Count ? thumbnailStrip.Controls[index] : null;
                 if (existing is Panel tile && tile.Tag is ThumbnailTileState state)
                 {
-                    UpdateThumbnailTile(tile, state, snapshot[index], index, index == activeIndex, cancellationToken);
+                    UpdateThumbnailTile(
+                        tile,
+                        state,
+                        snapshot[index],
+                        index,
+                        isSelected: index == activeIndex,
+                        isHovered: index == hoveredIndex,
+                        cancellationToken);
                     continue;
                 }
 
-                Control newTile = BuildThumbnailTile(snapshot[index], index, index == activeIndex, cancellationToken);
+                Control newTile = BuildThumbnailTile(
+                    snapshot[index],
+                    index,
+                    isSelected: index == activeIndex,
+                    isHovered: index == hoveredIndex,
+                    cancellationToken);
                 thumbnailStrip.Controls.Add(newTile);
                 thumbnailStrip.Controls.SetChildIndex(newTile, index);
             }
@@ -1199,6 +1220,7 @@ public sealed partial class MainForm : Form
         ScannerImageSelection image,
         int index,
         bool isSelected,
+        bool isHovered,
         CancellationToken cancellationToken)
     {
         var tile = new Panel
@@ -1211,6 +1233,7 @@ public sealed partial class MainForm : Form
             Cursor = Cursors.Hand,
         };
         tile.DoubleClick += (sender, _) => ShowFullscreenPreview(GetTileIndex((Control)sender!));
+        RegisterThumbnailHoverHandlers(tile);
         tile.Paint += (_, args) => DrawThumbnailBorder(
             args.Graphics,
             tile.ClientRectangle,
@@ -1225,11 +1248,12 @@ public sealed partial class MainForm : Form
             Cursor = Cursors.Hand,
         };
         thumbnail.DoubleClick += (sender, _) => ShowFullscreenPreview(GetTileIndex((Control)sender!));
+        RegisterThumbnailHoverHandlers(thumbnail);
         tile.Controls.Add(thumbnail);
 
         var state = new ThumbnailTileState(thumbnail);
         tile.Tag = state;
-        UpdateThumbnailTile(tile, state, image, index, isSelected, cancellationToken);
+        UpdateThumbnailTile(tile, state, image, index, isSelected, isHovered, cancellationToken);
 
         tile.Click += (sender, _) => SelectImage(GetTileIndex((Control)sender!));
         thumbnail.Click += (sender, _) => SelectImage(GetTileIndex((Control)sender!));
@@ -1242,14 +1266,16 @@ public sealed partial class MainForm : Form
         ScannerImageSelection image,
         int index,
         bool isSelected,
+        bool isHovered,
         CancellationToken cancellationToken)
     {
         state.Image = image;
         state.Index = index;
         state.IsSelected = isSelected;
+        state.IsHovered = isHovered;
 
         tile.BackColor = isSelected ? AccentSoft : Color.White;
-        if (isSelected)
+        if (isSelected || isHovered)
         {
             AddThumbnailActionControls(tile, index);
         }
@@ -1260,6 +1286,32 @@ public sealed partial class MainForm : Form
 
         EnsureThumbnailImage(state, image, ThumbnailImageSize, cancellationToken);
         tile.Invalidate();
+    }
+
+    private void RegisterThumbnailHoverHandlers(Control control)
+    {
+        control.MouseEnter += ThumbnailHoverEnter;
+        control.MouseLeave += ThumbnailHoverLeave;
+    }
+
+    private void ThumbnailHoverEnter(object? sender, EventArgs _)
+    {
+        if (sender is not Control control)
+        {
+            return;
+        }
+
+        SetHoveredImage(GetTileIndex(control));
+    }
+
+    private void ThumbnailHoverLeave(object? sender, EventArgs _)
+    {
+        if (sender is not Control control)
+        {
+            return;
+        }
+
+        ClearHoveredImageIfPointerOutside(control);
     }
 
     private static int GetTileIndex(Control control)
@@ -1399,26 +1451,31 @@ public sealed partial class MainForm : Form
 
         var moveLeft = BuildMoveButton("‹", index, -1, enabled: index > 0);
         moveLeft.Location = new Point(edgeInset, 72);
+        RegisterThumbnailHoverHandlers(moveLeft);
         tile.Controls.Add(moveLeft);
         moveLeft.BringToFront();
 
         var moveRight = BuildMoveButton("›", index, 1, enabled: index < totalCount - 1);
         moveRight.Location = new Point(tile.Width - moveRight.Width - edgeInset, 72);
+        RegisterThumbnailHoverHandlers(moveRight);
         tile.Controls.Add(moveRight);
         moveRight.BringToFront();
 
         var rotateLeft = BuildTileActionButton("↶", "左转 90°", index, () => RotateImage(index, -90));
         rotateLeft.Location = new Point(edgeInset, tile.Height - rotateLeft.Height - verticalInset);
+        RegisterThumbnailHoverHandlers(rotateLeft);
         tile.Controls.Add(rotateLeft);
         rotateLeft.BringToFront();
 
         var rotateRight = BuildTileActionButton("↷", "右转 90°", index, () => RotateImage(index, 90));
         rotateRight.Location = new Point(tile.Width - rotateRight.Width - edgeInset, tile.Height - rotateRight.Height - verticalInset);
+        RegisterThumbnailHoverHandlers(rotateRight);
         tile.Controls.Add(rotateRight);
         rotateRight.BringToFront();
 
         var deleteButton = BuildTileActionButton("×", "删除", index, () => RemoveImage(index), isDanger: true);
         deleteButton.Location = new Point(tile.Width - deleteButton.Width - 10, 12);
+        RegisterThumbnailHoverHandlers(deleteButton);
         tile.Controls.Add(deleteButton);
         deleteButton.BringToFront();
     }
@@ -1515,33 +1572,114 @@ public sealed partial class MainForm : Form
 
         if (changed)
         {
-            UpdateThumbnailSelection(previousIndex, isSelected: false);
-            UpdateThumbnailSelection(index, isSelected: true);
+            UpdateThumbnailVisualState(previousIndex);
+            UpdateThumbnailVisualState(index);
             UpdateStatus();
         }
     }
 
-    private void UpdateThumbnailSelection(int index, bool isSelected)
+    private void SetHoveredImage(int index)
+    {
+        int previousIndex;
+        bool changed = false;
+        lock (stateLock)
+        {
+            if (index < 0 || index >= selectedImages.Count)
+            {
+                return;
+            }
+
+            previousIndex = hoveredImageIndex;
+            if (hoveredImageIndex != index)
+            {
+                hoveredImageIndex = index;
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            UpdateThumbnailVisualState(previousIndex);
+            UpdateThumbnailVisualState(index);
+        }
+    }
+
+    private void ClearHoveredImageIfPointerOutside(Control control)
+    {
+        Panel? tile = GetThumbnailTile(control);
+        if (tile is null)
+        {
+            return;
+        }
+
+        if (tile.RectangleToScreen(tile.ClientRectangle).Contains(Control.MousePosition))
+        {
+            return;
+        }
+
+        int index = GetTileIndex(tile);
+        bool changed = false;
+        lock (stateLock)
+        {
+            if (hoveredImageIndex == index)
+            {
+                hoveredImageIndex = -1;
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            UpdateThumbnailVisualState(index);
+        }
+    }
+
+    private static Panel? GetThumbnailTile(Control control)
+    {
+        for (Control? current = control; current is not null; current = current.Parent)
+        {
+            if (current is Panel tile && current.Tag is ThumbnailTileState)
+            {
+                return tile;
+            }
+        }
+
+        return null;
+    }
+
+    private void UpdateThumbnailVisualState(int index)
     {
         if (index < 0 || index >= thumbnailStrip.Controls.Count)
         {
             return;
         }
 
-        if (thumbnailStrip.Controls[index] is not Panel tile)
+        if (thumbnailStrip.Controls[index] is not Panel tile ||
+            tile.Tag is not ThumbnailTileState state)
         {
             return;
         }
 
-        tile.SuspendLayout();
-        tile.BackColor = isSelected ? AccentSoft : Color.White;
-        if (tile.Tag is ThumbnailTileState state)
+        bool isSelected;
+        bool isHovered;
+        lock (stateLock)
         {
-            state.Index = index;
-            state.IsSelected = isSelected;
+            if (index < 0 || index >= selectedImages.Count)
+            {
+                return;
+            }
+
+            isSelected = selectedImageIndex == index;
+            isHovered = hoveredImageIndex == index;
         }
 
-        if (isSelected)
+        tile.SuspendLayout();
+        state.Index = index;
+        state.IsSelected = isSelected;
+        state.IsHovered = isHovered;
+        tile.BackColor = isSelected ? AccentSoft : Color.White;
+
+        if (isSelected || isHovered)
         {
             AddThumbnailActionControls(tile, index);
         }
@@ -1574,8 +1712,8 @@ public sealed partial class MainForm : Form
 
         if (changed)
         {
-            UpdateThumbnailSelection(previousIndex, isSelected: false);
-            UpdateThumbnailSelection(index, isSelected: true);
+            UpdateThumbnailVisualState(previousIndex);
+            UpdateThumbnailVisualState(index);
             UpdateStatus();
         }
 
@@ -1854,6 +1992,8 @@ public sealed partial class MainForm : Form
         public int Index { get; set; }
 
         public bool IsSelected { get; set; }
+
+        public bool IsHovered { get; set; }
 
         public ThumbnailCacheKey? ThumbnailKey { get; set; }
 
